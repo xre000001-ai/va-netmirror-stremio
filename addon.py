@@ -1,0 +1,323 @@
+"""
+VA × NetMirror — a CONFIGURABLE stream-only Stremio addon that merges two
+native-HLS sources behind one configuration page:
+
+  ▶️ VA Player   — streamdata.vaplayer.ru/api.php (imdb+type → 3 HLS
+                   masters via nextgencloudfabric referer).  Ported from
+                   the CinemaVIP addon (Node).
+  🎬 NetMirror   — the full netmirror machinery (thash bootstrap, newtv +
+                   embed engines, exit pool) imported as nm_core.
+
+The /configure page lets the user pick which sources feed the addon and
+issues an encoded token; /{token}/manifest.json installs that selection.
+No token = both sources ON.  Stream cards are DIRECT provider links —
+zero addon bandwidth (tiny JSON only).
+
+Sections: 1 config · 2 token · 3 VA source · 4 merge · 5 config page ·
+6 server.
+"""
+
+import base64
+import gzip
+import json
+import os
+import re
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, unquote
+
+import requests
+
+import nm_core  # the battle-tested netmirror machinery (import-safe)
+
+# ------------------------------------------------------------------ 1 config
+VERSION = "1.0.0"
+BRAND = "VA × NetMirror"
+PORT = int(os.environ.get("PORT", "7000"))
+VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+VA_API = "https://streamdata.vaplayer.ru/api.php"
+VA_ORIGIN = "https://nextgencloudfabric.com"
+VA_TIMEOUT = 12.0
+
+DEFAULTS = {"va": True, "nm": True}
+
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": UA})
+
+MANIFEST_BASE = {
+    "id": "va.netmirror.stremio",
+    "version": VERSION,
+    "name": BRAND,
+    "description": (
+        "Two native-HLS sources behind one configuration page: ▶️ VA Player "
+        "(3 HLS servers) + 🎬 NetMirror (Netflix/Hotstar/Prime mirrors). "
+        "Open any movie or series from your catalogs — direct streams "
+        "appear. Pick your sources on the configure page."),
+    "logo": ("https://image.tmdb.org/t/p/w500/"
+             "9O1Iy9odqMlHfBCXg7xw3fPnXnz.jpg"),
+    "types": ["movie", "series"],
+    "resources": ["stream"],
+    "idPrefixes": ["tt"],
+    "catalogs": [],
+    "behaviorHints": {"configurable": True,
+                      "configurationRequired": False},
+}
+
+
+def manifest_for(cfg):
+    m = dict(MANIFEST_BASE)
+    on = [n for n, key in (("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"))
+          if cfg.get(key)]
+    m["description"] = ("Sources: %s. Open any movie or series from your "
+                        "catalogs — direct native-HLS streams appear. "
+                        "Reconfigure any time." % (", ".join(on) or "none"))
+    return m
+
+
+# ------------------------------------------------------------------ 2 token
+def encode_cfg(cfg):
+    raw = json.dumps(cfg, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cfg(token):
+    try:
+        pad = "=" * (-len(token) % 4)
+        cfg = json.loads(base64.urlsafe_b64decode(token + pad).decode())
+        if not isinstance(cfg, dict):
+            return None
+        return {k: bool(cfg.get(k, DEFAULTS.get(k, False)))
+                for k in DEFAULTS}
+    except Exception:
+        return None
+
+
+def cfg_from_path(path):
+    """'/cfg-<token>/...' or no token -> (cfg, rest)."""
+    if path.startswith("/cfg-"):
+        token, _, rest = path[5:].partition("/")
+        cfg = decode_cfg(token)
+        if cfg:
+            return cfg, "/" + rest if rest else "/"
+        return dict(DEFAULTS), path
+    return dict(DEFAULTS), path
+
+
+# --------------------------------------------------------------- 3 VA source
+_VA_CACHE = {}
+
+
+def va_streams(identifier, media_type, season=None, episode=None):
+    """▶️ VA Player: imdb id -> native HLS masters (positive-probed)."""
+    key = (identifier, media_type, season, episode)
+    hit = _VA_CACHE.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    params = {"imdb": identifier,
+              "type": "tv" if media_type == "series" else "movie"}
+    referer = "%s/embed/%s/%s" % (VA_ORIGIN, params["type"], identifier)
+    if media_type == "series" and season and episode:
+        params["season"] = str(season)
+        params["episode"] = str(episode)
+        referer += "/%s/%s" % (season, episode)
+    cards = []
+    try:
+        r = HTTP.get(VA_API, params=params, timeout=VA_TIMEOUT,
+                     headers={"Referer": referer, "Origin": VA_ORIGIN})
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data") or {}
+            title = str(data.get("title") or "")
+            if str((r.json() or {}).get("status_code")) == "200":
+                for i, u in enumerate(data.get("stream_urls") or []):
+                    ok = _va_probe(u)
+                    cards.append({
+                        "name": "▶️ VA · Server %d%s" % (i + 1,
+                                                         "" if ok else " ·?"),
+                        "title": "%s\nHLS · plays in the Stremio app" % title,
+                        "url": u,
+                        "behaviorHints": {"notWebReady": False},
+                        "_va": True,
+                    })
+    except Exception:
+        cards = []
+    # keep positives 20 min; empty answers 3 min (retry sooner)
+    _VA_CACHE[key] = (time.time() + (1200 if cards else 180), cards)
+    return cards
+
+
+def _va_probe(url):
+    """Positive-only gate: the master must really answer HLS."""
+    try:
+        r = HTTP.get(url, timeout=10, stream=True,
+                     headers={"Referer": VA_ORIGIN + "/"})
+        ok = r.status_code == 200 and "#EXTM3U" in next(
+            r.iter_content(64), b"").decode("utf-8", "ignore")
+        r.close()
+        return ok
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ 4 merge
+def build_streams(cfg, media_type, identifier, season=None, episode=None):
+    streams = []
+    notes = []
+    if cfg.get("va"):
+        va = va_streams(identifier, media_type, season, episode)
+        if va:
+            streams.extend(va)
+        else:
+            notes.append("VA: no server answered")
+    if cfg.get("nm"):
+        try:
+            nm = nm_core.streams_for_tt(
+                media_type, identifier,
+                int(season or 0), int(episode or 0))
+            # netmirror cards are direct CDN links; rebase any relative
+            # route defensively (none expected in v1.2.6, but cheap).
+            for c in nm:
+                u = c.get("url") or ""
+                if u.startswith("/"):
+                    c = dict(c)
+                    base = VN_PUBLIC_URL or "https://va-netmirror.baby-beamup.club"
+                    c["url"] = base + u
+                streams.append(c)
+        except Exception as exc:
+            notes.append("NetMirror error: %s" % str(exc)[:60])
+        if not nm_core.streams_for_tt_cached_lenient(
+                media_type, identifier, season, episode):
+            notes.append("NetMirror: nothing found")
+    msg = ""
+    if not streams:
+        msg = " · ".join(notes) or "no source returned streams"
+    return {"streams": streams[:20], "message": msg}
+
+
+# fallback helper used above so a missing helper never breaks the merge
+def _nm_lenient(kind, tt, s, e):
+    try:
+        return nm_core.streams_for_tt(kind, tt, int(s or 0), int(e or 0))
+    except Exception:
+        return []
+
+
+setattr(nm_core, "streams_for_tt_cached_lenient",
+        lambda kind, tt, s, e: _nm_lenient(kind, tt, s, e))
+
+# ------------------------------------------------------------ 5 config page
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VA × NetMirror — configure</title>
+<style>
+body{background:#0b0f17;color:#e8ecf4;font-family:system-ui,sans-serif;
+max-width:640px;margin:36px auto;padding:0 20px;line-height:1.55}
+h1{font-size:26px} small{color:#8ea0b5}
+.src{background:#111a27;border:1px solid #223047;border-radius:12px;
+padding:14px 18px;margin:12px 0;display:flex;gap:12px;align-items:center}
+.src b{font-size:16px} .src p{margin:2px 0 0;color:#9fb2c6;font-size:13px}
+button{background:#e50914;color:#fff;border:0;border-radius:10px;
+padding:13px 26px;font-weight:700;font-size:16px;cursor:pointer;margin-top:8px}
+code{background:#151c2b;padding:2px 6px;border-radius:6px;font-size:13px}
+</style></head><body>
+<h1>🎬 VA × NetMirror <small>v__VER__</small></h1>
+<p>Pick the sources you want, then install. You can come back and
+reconfigure any time.</p>
+<div class="src"><input type="checkbox" id="va" checked>
+ <div><b>▶️ VA Player</b>
+ <p>3 native-HLS servers per title · plays in the Stremio app</p></div></div>
+<div class="src"><input type="checkbox" id="nm" checked>
+ <div><b>🎬 NetMirror</b>
+ <p>Netflix / Hotstar / Prime mirrors · multi-audio HLS + mp4, direct CDN</p></div></div>
+<button onclick="install()">Install in Stremio</button>
+<p id="link" style="margin-top:14px"></p>
+<p><small>Cards are direct provider links — the addon relays no media.
+Configure = choose sources; the choice travels inside the install URL.</small></p>
+<script>
+function tok(){const c={va:document.getElementById('va').checked,
+nm:document.getElementById('nm').checked};
+let b=btoa(JSON.stringify(c)).replace(/=+$/,'');return b}
+function install(){const t=tok();
+location.href='/cfg-'+t+'/manifest.json'}
+</script></body></html>""".replace("__VER__", VERSION)
+
+LOGO = ("https://image.tmdb.org/t/p/w500/"
+        "9O1Iy9odqMlHfBCXg7xw3fPnXnz.jpg")
+
+# ------------------------------------------------------------------ 6 server
+_START = time.time()
+STATS = {"requests": 0, "streams": 0, "cards": 0}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json", extra=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        head = {"Content-Type": ctype,
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=120",
+                "Connection": "close"}
+        if extra:
+            head.update(extra)
+        if "gzip" in (self.headers.get("Accept-Encoding") or "") \
+                and len(body) > 500 and "text" in ctype:
+            body = gzip.compress(body)
+            head["Content-Encoding"] = "gzip"
+        head["Content-Length"] = str(len(body))
+        self.send_response(code)
+        for k, v in head.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        STATS["requests"] += 1
+        raw = urlparse(self.path)
+        path = unquote(raw.path)
+        try:
+            if path in ("/", "/configure"):
+                return self._send(200, PAGE, "text/html; charset=utf-8")
+            if path == "/health":
+                return self._send(200, {"ok": True, "addon": BRAND,
+                                        "version": VERSION,
+                                        "uptime_s": round(time.time() - _START, 1),
+                                        "stats": STATS})
+            cfg, rest = cfg_from_path(path)
+            if rest == "/manifest.json":
+                return self._send(200, manifest_for(cfg))
+            m = re.fullmatch(r"/stream/movie/(tt\d+)\.json", rest)
+            if m:
+                STATS["streams"] += 1
+                out = build_streams(cfg, "movie", m.group(1))
+                STATS["cards"] += len(out.get("streams") or [])
+                return self._send(200, out)
+            m = re.fullmatch(r"/stream/series/(tt\d+):(\d+):(\d+)\.json", rest)
+            if m:
+                STATS["streams"] += 1
+                out = build_streams(cfg, "series", m.group(1),
+                                    int(m.group(2)), int(m.group(3)))
+                STATS["cards"] += len(out.get("streams") or [])
+                return self._send(200, out)
+            return self._send(404, {"error": "not found"})
+        except Exception as exc:
+            return self._send(500, {"error": "internal",
+                                    "detail": str(exc)[:160]})
+
+
+def main():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print("%s %s listening on :%d" % (BRAND, VERSION, PORT), flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

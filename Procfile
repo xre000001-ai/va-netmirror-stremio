@@ -1,0 +1,1 @@
+web: python addon.py
