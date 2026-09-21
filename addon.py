@@ -31,7 +31,7 @@ import requests
 import nm_core  # the battle-tested netmirror machinery (import-safe)
 
 # ------------------------------------------------------------------ 1 config
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 BRAND = "VA × NetMirror"
 PORT = int(os.environ.get("PORT", "7000"))
 VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")

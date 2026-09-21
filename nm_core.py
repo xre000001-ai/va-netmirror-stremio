@@ -89,7 +89,7 @@ ADDON_ID  = "netmirror"
 ADDON_NAME = "NetMirror"
 
 CINEMETA = "https://v3-cinemeta.strem.io"
-TMDB_KEY = "1af06616dcbb28ff03088d87d63211f5"   # public addon default key
+TMDB_KEY = os.environ.get("TMDB_KEY", "")   # set via env/config (no hardcoded keys)
 
 BUDGET      = 26.0    # seconds for a cold /stream (throttle/proxy bound); cached after
 BG_BUDGET   = 55.0    # background Engine-A retry budget (v1.0.3 late-finish cache)    # seconds for a cold /stream (throttle/proxy bound); cached after

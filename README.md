@@ -33,3 +33,6 @@ Procfile build (`web: python addon.py`), no Dockerfile:
 ```
 git push beamup HEAD:refs/heads/master --force   # detached commit, Dockerfile removed
 ```
+
+## v1.0.1
+- Security: TMDB key no longer hardcoded — read from `TMDB_KEY` env/config var (public-repo key policy). Falls back to IMDb-suggest title resolution if unset.
