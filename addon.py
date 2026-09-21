@@ -349,6 +349,18 @@ class Handler(BaseHTTPRequestHandler):
             cfg, rest = cfg_from_path(path)
             if rest == "/manifest.json":
                 return self._send(200, manifest_for(cfg))
+            if rest == "/debug/mb":
+                info = {}
+                try:
+                    info["pool_all"] = len(mb_core._pool_all())
+                    info["pool_healthy"] = len(mb_core._pool_healthy())
+                    info["plat_ok"] = mb_core._plat_ok()
+                    info["has_auth_token"] = mb_core._AUTH_TOKEN is not None
+                    info["pool_free_on"] = bool(mb_core._FREE_POOL_ON[0])
+                    info["reqlog_tail"] = list(mb_core._REQLOG)[-6:]
+                except Exception as exc:
+                    info["err"] = str(exc)[:140]
+                return self._send(200, info)
             # moviebox quality-menu HLS layer (playlist TEXT only —
             # segments are absolute signed CDN URLs, zero media bytes)
             m = re.fullmatch(
