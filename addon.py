@@ -376,13 +376,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, body,
                                   "application/vnd.apple.mpegurl")
             fwd = self.headers.get("X-Forwarded-Host")
-            if fwd:
+            if VN_PUBLIC_URL:
+                # beamup's router forwards a TRUNCATED internal vhost in
+                # X-Forwarded-Host (v1.9.13 lesson) — the configured
+                # public URL wins
+                host_base = VN_PUBLIC_URL
+            elif fwd:
                 host_base = "https://" + fwd.split(",")[0].strip()
             elif self.headers.get("Host"):
                 host_base = "https://" + self.headers.get("Host")
             else:
-                host_base = VN_PUBLIC_URL or \
-                    "http://127.0.0.1:%d" % PORT
+                host_base = "http://127.0.0.1:%d" % PORT
             m = re.fullmatch(r"/stream/movie/(tt\d+)\.json", rest)
             if m:
                 STATS["streams"] += 1

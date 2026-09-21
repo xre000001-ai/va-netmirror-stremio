@@ -41,7 +41,7 @@ git push beamup HEAD:refs/heads/master --force
 Config vars: `TMDB_KEY`, `MB_SECRET_KEY` (env/config only — no keys in the repo).
 
 ## Changelog
-### v1.1.0
+### v1.1.0 (r2: public-URL host_base fix)
 - **New: 📦 MovieBox source** — third toggle on the configure page; cards
   rebranded `♧ → 📦` so sources are tellable apart; `/hls` playlist routes
   added; mb pool/token machinery boots with the addon.
