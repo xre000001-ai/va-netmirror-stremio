@@ -37,21 +37,28 @@ class FakeResponse:
 
 class TokenTests(unittest.TestCase):
     def test_roundtrip_defaults(self):
-        t = addon.encode_cfg({"va": True, "nm": True})
-        self.assertEqual(addon.decode_cfg(t), {"va": True, "nm": True})
+        t = addon.encode_cfg({"va": True, "nm": True, "mb": True})
+        self.assertEqual(addon.decode_cfg(t),
+                         {"va": True, "nm": True, "mb": True})
+
+    def test_legacy_two_key_token_gains_mb_default_on(self):
+        t = addon.encode_cfg({"va": False, "nm": True})   # pre-1.1.0 token
+        self.assertEqual(addon.decode_cfg(t),
+                         {"va": False, "nm": True, "mb": True})
 
     def test_partial_and_invalid(self):
-        t = addon.encode_cfg({"va": True, "nm": False})
-        self.assertEqual(addon.decode_cfg(t), {"va": True, "nm": False})
+        t = addon.encode_cfg({"va": True, "nm": False, "mb": False})
+        self.assertEqual(addon.decode_cfg(t),
+                         {"va": True, "nm": False, "mb": False})
         self.assertIsNone(addon.decode_cfg("!!!not-base64-json!!!"))
 
     def test_cfg_from_path(self):
-        t = addon.encode_cfg({"va": False, "nm": True})
+        t = addon.encode_cfg({"va": False, "nm": True, "mb": True})
         cfg, rest = addon.cfg_from_path("/cfg-%s/stream/movie/tt1.json" % t)
-        self.assertEqual(cfg, {"va": False, "nm": True})
+        self.assertEqual(cfg, {"va": False, "nm": True, "mb": True})
         self.assertEqual(rest, "/stream/movie/tt1.json")
         cfg2, rest2 = addon.cfg_from_path("/stream/movie/tt1.json")
-        self.assertEqual(cfg2, {"va": True, "nm": True})
+        self.assertEqual(cfg2, {"va": True, "nm": True, "mb": True})
 
 
 class ManifestTests(unittest.TestCase):
@@ -139,8 +146,8 @@ class MergeTests(unittest.TestCase):
         with mock.patch.object(addon, "va_streams", return_value=va), \
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=nm):
-            out = addon.build_streams({"va": True, "nm": True},
-                                      "movie", "tt1375666")
+            out = addon.build_streams({"va": True, "nm": True,
+                                       "mb": False}, "movie", "tt1375666")
         self.assertEqual([c["name"] for c in out["streams"]],
                          ["▶️ VA · Server 1", "NM card"])
 
@@ -148,8 +155,8 @@ class MergeTests(unittest.TestCase):
         with mock.patch.object(addon, "va_streams") as va, \
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=[]) as nm:
-            out = addon.build_streams({"va": True, "nm": False},
-                                      "movie", "tt1")
+            out = addon.build_streams({"va": True, "nm": False,
+                                       "mb": False}, "movie", "tt1")
             va.assert_called_once()
             nm.assert_not_called()
         self.assertEqual(out["streams"], [])
@@ -160,18 +167,125 @@ class MergeTests(unittest.TestCase):
         with mock.patch.object(addon, "va_streams", return_value=[]), \
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=nm):
-            out = addon.build_streams({"va": False, "nm": True},
-                                      "movie", "tt2")
+            out = addon.build_streams({"va": False, "nm": True,
+                                       "mb": False}, "movie", "tt2")
         self.assertTrue(out["streams"][0]["url"].startswith("https://"))
 
     def test_empty_message_mentions_notes(self):
         with mock.patch.object(addon, "va_streams", return_value=[]), \
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=[]):
-            out = addon.build_streams({"va": True, "nm": True},
-                                      "movie", "tt0")
+            out = addon.build_streams({"va": True, "nm": True,
+                                       "mb": False}, "movie", "tt0")
         self.assertIn("VA", out["message"])
         self.assertIn("NetMirror", out["message"])
+
+
+class MovieBoxMergeTests(unittest.TestCase):
+    def setUp(self):
+        reset_caches()
+
+    def test_mb_cards_relabeled_and_rebased(self):
+        mb = {"streams": [{"name": "♧ FHD 1080p  ✹ Inception",
+                           "url": "/hls/123456789/1/1/master.m3u8",
+                           "behaviorHints": {"notWebReady": True}}]}
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams",
+                               return_value=mb):
+            out = addon.build_streams(
+                dict(addon.DEFAULTS), "movie", "tt1375666",
+                host_base="https://vnh.example")
+        self.assertEqual(len(out["streams"]), 1)
+        c = out["streams"][0]
+        self.assertTrue(c["name"].startswith("📦"))
+        self.assertFalse(c["name"].startswith("♧"))
+        self.assertEqual(c["url"],
+                         "https://vnh.example/hls/123456789/1/1/master.m3u8")
+
+    def test_mb_off_means_no_call(self):
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams") as mbc:
+            out = addon.build_streams({"va": False, "nm": True,
+                                       "mb": False}, "movie", "tt1")
+            mbc.assert_not_called()
+        self.assertEqual(out["streams"], [])
+
+    def test_mb_error_is_honest_note_not_crash(self):
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams",
+                               side_effect=RuntimeError("platform down")):
+            out = addon.build_streams(dict(addon.DEFAULTS),
+                                      "movie", "tt1")
+        self.assertIn("MovieBox error", out["message"])
+
+    def test_mb_se_ep_passthrough(self):
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams",
+                               return_value=[]) as mbc:
+            addon.build_streams(dict(addon.DEFAULTS), "series", "tt9",
+                                2, 7)
+        mbc.assert_called_once_with("series", "tt9", 2, 7)
+
+    def test_mb_direct_urls_untouched(self):
+        mb = {"streams": [{"name": "♧ SD 480p ✹ X",
+                           "url": "https://sbcdn.example/dash/x/index.mpd"}]}
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams",
+                               return_value=mb):
+            out = addon.build_streams(dict(addon.DEFAULTS),
+                                      "movie", "tt3")
+        self.assertEqual(out["streams"][0]["url"],
+                         "https://sbcdn.example/dash/x/index.mpd")
+
+
+class HlsRouteTests(unittest.TestCase):
+    def test_hls_route_serves_mb_playlist_text(self):
+        import threading
+        import http.client
+        calls = []
+
+        def fake_lazy(sid, se, ep, kind):
+            calls.append((sid, se, ep, kind))
+            return "#EXTM3U\n#EXT-X-VERSION:7\n"
+
+        server = addon.ThreadingHTTPServer(("127.0.0.1", 0), addon.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.object(addon.mb_core, "_lazy_hls",
+                                   side_effect=fake_lazy):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", "/hls/123456789/1/1/master.m3u8")
+                r = c.getresponse()
+                body = r.read()
+                c.close()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(body, b"#EXTM3U\n#EXT-X-VERSION:7\n")
+            self.assertIn("mpegurl", r.getheader("Content-Type"))
+            self.assertEqual(calls, [("123456789", 1, 1, "master")])
+            # miss -> honest HLS 404
+            with mock.patch.object(addon.mb_core, "_lazy_hls",
+                                   return_value=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", "/hls/123456789/1/1/v0.m3u8")
+                r = c.getresponse()
+                body = r.read()
+                c.close()
+            self.assertEqual(r.status, 404)
+            self.assertTrue(body.startswith(b"#EXTM3U"))
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class ServerSmokeTests(unittest.TestCase):
@@ -192,12 +306,14 @@ class ServerSmokeTests(unittest.TestCase):
             st, body = get("/configure")
             self.assertEqual(st, 200)
             self.assertIn(b"VA Player", body)
-            t = addon.encode_cfg({"va": False, "nm": True})
+            self.assertIn(b"MovieBox", body)
+            t = addon.encode_cfg({"va": False, "nm": True, "mb": True})
             st, body = get("/cfg-%s/manifest.json" % t)
             m = json.loads(body)
             self.assertIn("NetMirror", m["description"])
             st, body = get("/health")
             self.assertEqual(json.loads(body)["ok"], True)
+            self.assertEqual(json.loads(body)["version"], "1.1.0")
             st, body = get("/nope")
             self.assertEqual(st, 404)
         finally:

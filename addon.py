@@ -7,11 +7,14 @@ native-HLS sources behind one configuration page:
                    the CinemaVIP addon (Node).
   🎬 NetMirror   — the full netmirror machinery (thash bootstrap, newtv +
                    embed engines, exit pool) imported as nm_core.
+  📦 MovieBox    — the full moviebox machinery (aoneroom api, edge-cache
+                   cookie scheme, exit pool) imported as mb_core; its /hls
+                   playlist routes are served by this addon (text only).
 
 The /configure page lets the user pick which sources feed the addon and
 issues an encoded token; /{token}/manifest.json installs that selection.
-No token = both sources ON.  Stream cards are DIRECT provider links —
-zero addon bandwidth (tiny JSON only).
+No token = all sources ON.  Stream cards are DIRECT provider links —
+zero addon bandwidth (tiny JSON + tiny playlists only).
 
 Sections: 1 config · 2 token · 3 VA source · 4 merge · 5 config page ·
 6 server.
@@ -22,6 +25,7 @@ import gzip
 import json
 import os
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -29,9 +33,26 @@ from urllib.parse import urlparse, unquote
 import requests
 
 import nm_core  # the battle-tested netmirror machinery (import-safe)
+import mb_core  # the battle-tested moviebox machinery (import-safe)
+
+
+def _mb_boot():
+    """Start mb_core's background machinery (pool refresh + trainer +
+    token prewarm) exactly like its main() does, minus the HTTP server
+    and the keepalive self-ping (this addon has its own port)."""
+    try:
+        mb_core._FREE_POOL_ON[0] = True
+        threading.Thread(target=mb_core._free_pool_loop, daemon=True).start()
+        threading.Thread(target=mb_core._pool_train_loop, daemon=True).start()
+        threading.Thread(target=mb_core._boot_prewarm, daemon=True).start()
+    except Exception as exc:
+        print("mb background boot skipped: %s" % exc, flush=True)
+
+
+_mb_boot()
 
 # ------------------------------------------------------------------ 1 config
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 BRAND = "VA × NetMirror"
 PORT = int(os.environ.get("PORT", "7000"))
 VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")
@@ -42,7 +63,7 @@ VA_API = "https://streamdata.vaplayer.ru/api.php"
 VA_ORIGIN = "https://nextgencloudfabric.com"
 VA_TIMEOUT = 12.0
 
-DEFAULTS = {"va": True, "nm": True}
+DEFAULTS = {"va": True, "nm": True, "mb": True}
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": UA})
@@ -52,10 +73,11 @@ MANIFEST_BASE = {
     "version": VERSION,
     "name": BRAND,
     "description": (
-        "Two native-HLS sources behind one configuration page: ▶️ VA Player "
-        "(3 HLS servers) + 🎬 NetMirror (Netflix/Hotstar/Prime mirrors). "
-        "Open any movie or series from your catalogs — direct streams "
-        "appear. Pick your sources on the configure page."),
+        "Three stream sources behind one configuration page: ▶️ VA Player "
+        "(3 HLS servers) + 🎬 NetMirror (Netflix/Hotstar/Prime mirrors) + "
+        "📦 MovieBox (multi-audio HLS). Open any movie or series from your "
+        "catalogs — direct streams appear. Pick your sources on the "
+        "configure page."),
     "logo": ("https://image.tmdb.org/t/p/w500/"
              "9O1Iy9odqMlHfBCXg7xw3fPnXnz.jpg"),
     "types": ["movie", "series"],
@@ -69,7 +91,8 @@ MANIFEST_BASE = {
 
 def manifest_for(cfg):
     m = dict(MANIFEST_BASE)
-    on = [n for n, key in (("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"))
+    on = [n for n, key in (("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"),
+                           ("📦 MovieBox", "mb"))
           if cfg.get(key)]
     m["description"] = ("Sources: %s. Open any movie or series from your "
                         "catalogs — direct native-HLS streams appear. "
@@ -162,7 +185,8 @@ def _va_probe(url):
 
 
 # ------------------------------------------------------------------ 4 merge
-def build_streams(cfg, media_type, identifier, season=None, episode=None):
+def build_streams(cfg, media_type, identifier, season=None, episode=None,
+                  host_base=None):
     streams = []
     notes = []
     if cfg.get("va"):
@@ -182,7 +206,8 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None):
                 u = c.get("url") or ""
                 if u.startswith("/"):
                     c = dict(c)
-                    base = VN_PUBLIC_URL or "https://va-netmirror.baby-beamup.club"
+                    base = host_base or VN_PUBLIC_URL or \
+                        "https://va-netmirror.baby-beamup.club"
                     c["url"] = base + u
                 streams.append(c)
         except Exception as exc:
@@ -190,6 +215,32 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None):
         if not nm_core.streams_for_tt_cached_lenient(
                 media_type, identifier, season, episode):
             notes.append("NetMirror: nothing found")
+    if cfg.get("mb"):
+        try:
+            mbres = mb_core.build_streams(
+                media_type, identifier,
+                int(season or 1), int(episode or 1))
+            # moviebox build_streams returns {"streams": [...]} (its own
+            # /stream route does res.get("streams")) — accept both shapes.
+            mb = (mbres.get("streams") or []) \
+                if isinstance(mbres, dict) else (mbres or [])
+            for c in mb:
+                c = dict(c)
+                nm_label = c.get("name") or ""
+                # moviebox cards lead with ♧ — rebrand so the three
+                # sources are tellable apart in the player UI
+                if nm_label.startswith("♧"):
+                    c["name"] = "📦 " + nm_label[1:].lstrip()
+                u = c.get("url") or ""
+                if u.startswith("/"):
+                    base = host_base or VN_PUBLIC_URL or \
+                        "https://va-netmirror.baby-beamup.club"
+                    c["url"] = base + u
+                streams.append(c)
+            if not mb:
+                notes.append("MovieBox: nothing found")
+        except Exception as exc:
+            notes.append("MovieBox error: %s" % str(exc)[:60])
     msg = ""
     if not streams:
         msg = " · ".join(notes) or "no source returned streams"
@@ -231,13 +282,17 @@ reconfigure any time.</p>
 <div class="src"><input type="checkbox" id="nm" checked>
  <div><b>🎬 NetMirror</b>
  <p>Netflix / Hotstar / Prime mirrors · multi-audio HLS + mp4, direct CDN</p></div></div>
+<div class="src"><input type="checkbox" id="mb" checked>
+ <div><b>📦 MovieBox</b>
+ <p>Multi-audio HLS (dubs) · quality menu via tiny playlists, direct CDN</p></div></div>
 <button onclick="install()">Install in Stremio</button>
 <p id="link" style="margin-top:14px"></p>
 <p><small>Cards are direct provider links — the addon relays no media.
 Configure = choose sources; the choice travels inside the install URL.</small></p>
 <script>
 function tok(){const c={va:document.getElementById('va').checked,
-nm:document.getElementById('nm').checked};
+nm:document.getElementById('nm').checked,
+mb:document.getElementById('mb').checked};
 let b=btoa(JSON.stringify(c)).replace(/=+$/,'');return b}
 function install(){const t=tok();
 location.href='/cfg-'+t+'/manifest.json'}
@@ -294,17 +349,41 @@ class Handler(BaseHTTPRequestHandler):
             cfg, rest = cfg_from_path(path)
             if rest == "/manifest.json":
                 return self._send(200, manifest_for(cfg))
+            # moviebox quality-menu HLS layer (playlist TEXT only —
+            # segments are absolute signed CDN URLs, zero media bytes)
+            m = re.fullmatch(
+                r"/hls/(\d{5,25})/(\d{1,3})/(\d{1,5})/(master|v\d+|a\d+)\.m3u8",
+                rest)
+            if m:
+                body = mb_core._lazy_hls(m.group(1), int(m.group(2)),
+                                         int(m.group(3)), m.group(4))
+                if body is None:
+                    return self._send(
+                        404, "#EXTM3U\n#error no stream for this entry\n",
+                        "application/vnd.apple.mpegurl")
+                return self._send(200, body,
+                                  "application/vnd.apple.mpegurl")
+            fwd = self.headers.get("X-Forwarded-Host")
+            if fwd:
+                host_base = "https://" + fwd.split(",")[0].strip()
+            elif self.headers.get("Host"):
+                host_base = "https://" + self.headers.get("Host")
+            else:
+                host_base = VN_PUBLIC_URL or \
+                    "http://127.0.0.1:%d" % PORT
             m = re.fullmatch(r"/stream/movie/(tt\d+)\.json", rest)
             if m:
                 STATS["streams"] += 1
-                out = build_streams(cfg, "movie", m.group(1))
+                out = build_streams(cfg, "movie", m.group(1),
+                                    host_base=host_base)
                 STATS["cards"] += len(out.get("streams") or [])
                 return self._send(200, out)
             m = re.fullmatch(r"/stream/series/(tt\d+):(\d+):(\d+)\.json", rest)
             if m:
                 STATS["streams"] += 1
                 out = build_streams(cfg, "series", m.group(1),
-                                    int(m.group(2)), int(m.group(3)))
+                                    int(m.group(2)), int(m.group(3)),
+                                    host_base=host_base)
                 STATS["cards"] += len(out.get("streams") or [])
                 return self._send(200, out)
             return self._send(404, {"error": "not found"})
