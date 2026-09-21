@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.19"
+VERSION   = "1.9.20"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2378,6 +2378,9 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
 
 _RESOURCE_ON = os.environ.get("MOVIEBOX_RESOURCE", "1") != "0"
 _RES_CACHE = {}
+_RES_STALE = {}          # key -> (ts, cards) — H5 mints flap empty; the
+                         # signed URLs outlive the flap by ~17h, so serve
+                         # the last good mint for up to 16h
 _H5_TOKEN = [None, 0.0]
 _H5_API = "https://h5-api.aoneroom.com"
 _H5_WEB = "https://h5.aoneroom.com"
@@ -2472,7 +2475,12 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     key = ("h5", str(sid))
     hit, val = _cache_get(_RES_CACHE, key)
     if hit:
-        return val or []
+        if val:
+            return val
+        st = _RES_STALE.get(key)
+        if st and time.time() - st[0] < 57600:
+            return st[1]
+        return []
     dp = _h5_detail_path(sid)
     if not dp:
         _cache_put(_RES_CACHE, key, None, 600)
@@ -2565,7 +2573,9 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     for c in cards:
         if "tran-audio" in (c.get("url") or ""):
             c["_api"] = "h5-play"
-    _cache_put(_RES_CACHE, key, cards or None, 1800 if cards else 600)
+    _cache_put(_RES_CACHE, key, cards or None, 21600 if cards else 600)
+    if cards:
+        _RES_STALE[key] = (time.time(), cards)
     return cards
 
 
@@ -2597,9 +2607,15 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
                 ctype, se, ep, year, label, [], via="Netnaija WEB"),
-            # signed DIRECT URL — zero bytes through Render, no headers
+            # signed DIRECT URL — zero media bytes; carries the file-CDN
+            # referer whitelist header (v1.9.19) for header-capable players
             "url": url,
-            "behaviorHints": {"notWebReady": False, "isBingeable": True},
+            "_api": "webmp4",
+            "behaviorHints": {"notWebReady": False, "isBingeable": True,
+                              "proxyHeaders": {"request": {
+                                  "Referer": STREAM_REFERER,
+                                  "Origin": STREAM_REFERER,
+                                  "User-Agent": UA_APP}}},
             "bingeGroup": "mbxw|%s:%s:%s|%s|%dp" % (
                 title, se if ctype == "series" else "",
                 ep if ctype == "series" else "", label, res_i),
@@ -2932,6 +2948,18 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 s["description"] = (head + "\n" + base + "  ⟡ " +
                                     _sub_line(shared)[2:]).rstrip()
     if streams:
+        # v1.9.19: tidy ordering (user: "etoh ogochano") — fast file cards
+        # first (probe-ranked), then web MP4s, the cookie-HLS ladder last
+        _fam = {"h5-dl": 0, "h5-play": 0, "webmp4": 1, "mobile-hls": 2}
+
+        def _ord(c):
+            fam = _fam.get(c.get("_api"))
+            if fam is None:
+                fam = 2 if "/hls/" in (c.get("url") or "") else 1
+            m = re.search(r"(\d{3,4})p", c.get("name") or "")
+            return (fam, -int(m.group(1)) if m else 0)
+
+        streams.sort(key=_ord)
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         _stale_put(key, streams)   # v1.9.3: sweeps expired entries on write
         if _prewarm_next and ctype == "series":
