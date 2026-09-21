@@ -52,7 +52,7 @@ def _mb_boot():
 _mb_boot()
 
 # ------------------------------------------------------------------ 1 config
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 BRAND = "VA × NetMirror"
 PORT = int(os.environ.get("PORT", "7000"))
 VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")
@@ -63,7 +63,7 @@ VA_API = "https://streamdata.vaplayer.ru/api.php"
 VA_ORIGIN = "https://nextgencloudfabric.com"
 VA_TIMEOUT = 12.0
 
-DEFAULTS = {"va": True, "nm": True, "mb": True}
+DEFAULTS = {"va": True, "nm": True, "mb_hls": True, "mb_file": True}
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": UA})
@@ -91,8 +91,9 @@ MANIFEST_BASE = {
 
 def manifest_for(cfg):
     m = dict(MANIFEST_BASE)
-    on = [n for n, key in (("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"),
-                           ("📦 MovieBox", "mb"))
+    on = [n for n, key in (
+              ("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"),
+              ("📦 MB HLS", "mb_hls"), ("📦 MB File", "mb_file"))
           if cfg.get(key)]
     m["description"] = ("Sources: %s. Open any movie or series from your "
                         "catalogs — direct native-HLS streams appear. "
@@ -107,13 +108,25 @@ def encode_cfg(cfg):
 
 
 def decode_cfg(token):
+    """v1.2.0: granular MovieBox selection — mb_hls (cookie DASH ladder,
+    the original slow-but-everywhere path) and mb_file (H5 signed MP4s,
+    fast + web-playable) are separate toggles.  Legacy tokens: 2-key
+    (va/nm) and 3-key (va/nm/mb) both map mb -> BOTH mb toggles."""
     try:
         pad = "=" * (-len(token) % 4)
         cfg = json.loads(base64.urlsafe_b64decode(token + pad).decode())
         if not isinstance(cfg, dict):
             return None
-        return {k: bool(cfg.get(k, DEFAULTS.get(k, False)))
-                for k in DEFAULTS}
+        out = {"va": bool(cfg.get("va", True)),
+               "nm": bool(cfg.get("nm", True))}
+        if "mb_hls" in cfg or "mb_file" in cfg:
+            out["mb_hls"] = bool(cfg.get("mb_hls", True))
+            out["mb_file"] = bool(cfg.get("mb_file", True))
+        else:
+            mb = bool(cfg.get("mb", True))
+            out["mb_hls"] = mb
+            out["mb_file"] = mb
+        return out
     except Exception:
         return None
 
@@ -215,7 +228,7 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None,
         if not nm_core.streams_for_tt_cached_lenient(
                 media_type, identifier, season, episode):
             notes.append("NetMirror: nothing found")
-    if cfg.get("mb"):
+    if cfg.get("mb_hls") or cfg.get("mb_file"):
         try:
             mbres = mb_core.build_streams(
                 media_type, identifier,
@@ -224,6 +237,13 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None,
             # /stream route does res.get("streams")) — accept both shapes.
             mb = (mbres.get("streams") or []) \
                 if isinstance(mbres, dict) else (mbres or [])
+            # v1.2.0: per-path selection — "/hls/" cards are the cookie
+            # DASH ladder, everything else is a header-free file
+            want_hls = bool(cfg.get("mb_hls"))
+            want_file = bool(cfg.get("mb_file"))
+            if not (want_hls and want_file):
+                mb = [c for c in mb
+                      if ("/hls/" in (c.get("url") or "")) == want_hls]
             for c in mb:
                 c = dict(c)
                 nm_label = c.get("name") or ""
@@ -282,9 +302,12 @@ reconfigure any time.</p>
 <div class="src"><input type="checkbox" id="nm" checked>
  <div><b>🎬 NetMirror</b>
  <p>Netflix / Hotstar / Prime mirrors · multi-audio HLS + mp4, direct CDN</p></div></div>
-<div class="src"><input type="checkbox" id="mb" checked>
- <div><b>📦 MovieBox</b>
- <p>Multi-audio HLS (dubs) · quality menu via tiny playlists, direct CDN</p></div></div>
+<div class="src"><input type="checkbox" id="mb_hls" checked>
+ <div><b>📦 MovieBox · HLS ladder</b>
+ <p>Quality menu (240p–1080p) + dubs · cookie-scoped DASH→HLS — works everywhere, slower CDN (the original path, stays ON)</p></div></div>
+<div class="src"><input type="checkbox" id="mb_file" checked>
+ <div><b>📦 MovieBox · File MP4 <small>(fast)</small></b>
+ <p>Signed MP4s from the H5 gateway — buffer-free, header-free, plays in Stremio Web too. Movies only.</p></div></div>
 <button onclick="install()">Install in Stremio</button>
 <p id="link" style="margin-top:14px"></p>
 <p><small>Cards are direct provider links — the addon relays no media.
@@ -292,7 +315,8 @@ Configure = choose sources; the choice travels inside the install URL.</small></
 <script>
 function tok(){const c={va:document.getElementById('va').checked,
 nm:document.getElementById('nm').checked,
-mb:document.getElementById('mb').checked};
+mb_hls:document.getElementById('mb_hls').checked,
+mb_file:document.getElementById('mb_file').checked};
 let b=btoa(JSON.stringify(c)).replace(/=+$/,'');return b}
 function install(){const t=tok();
 location.href='/cfg-'+t+'/manifest.json'}

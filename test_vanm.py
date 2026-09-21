@@ -37,28 +37,40 @@ class FakeResponse:
 
 class TokenTests(unittest.TestCase):
     def test_roundtrip_defaults(self):
-        t = addon.encode_cfg({"va": True, "nm": True, "mb": True})
+        t = addon.encode_cfg({"va": True, "nm": True,
+                              "mb_hls": True, "mb_file": False})
         self.assertEqual(addon.decode_cfg(t),
-                         {"va": True, "nm": True, "mb": True})
+                         {"va": True, "nm": True,
+                          "mb_hls": True, "mb_file": False})
 
     def test_legacy_two_key_token_gains_mb_default_on(self):
         t = addon.encode_cfg({"va": False, "nm": True})   # pre-1.1.0 token
         self.assertEqual(addon.decode_cfg(t),
-                         {"va": False, "nm": True, "mb": True})
+                         {"va": False, "nm": True,
+                          "mb_hls": True, "mb_file": True})
+
+    def test_legacy_three_key_mb_maps_to_both(self):
+        t = addon.encode_cfg({"va": True, "nm": True, "mb": False})
+        self.assertEqual(addon.decode_cfg(t),
+                         {"va": True, "nm": True,
+                          "mb_hls": False, "mb_file": False})
 
     def test_partial_and_invalid(self):
         t = addon.encode_cfg({"va": True, "nm": False, "mb": False})
         self.assertEqual(addon.decode_cfg(t),
-                         {"va": True, "nm": False, "mb": False})
+                         {"va": True, "nm": False,
+                          "mb_hls": False, "mb_file": False})
         self.assertIsNone(addon.decode_cfg("!!!not-base64-json!!!"))
 
     def test_cfg_from_path(self):
-        t = addon.encode_cfg({"va": False, "nm": True, "mb": True})
+        t = addon.encode_cfg({"va": False, "nm": True})
         cfg, rest = addon.cfg_from_path("/cfg-%s/stream/movie/tt1.json" % t)
-        self.assertEqual(cfg, {"va": False, "nm": True, "mb": True})
+        self.assertEqual(cfg, {"va": False, "nm": True,
+                               "mb_hls": True, "mb_file": True})
         self.assertEqual(rest, "/stream/movie/tt1.json")
         cfg2, rest2 = addon.cfg_from_path("/stream/movie/tt1.json")
-        self.assertEqual(cfg2, {"va": True, "nm": True, "mb": True})
+        self.assertEqual(cfg2, {"va": True, "nm": True,
+                                "mb_hls": True, "mb_file": True})
 
 
 class ManifestTests(unittest.TestCase):
@@ -147,7 +159,7 @@ class MergeTests(unittest.TestCase):
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=nm):
             out = addon.build_streams({"va": True, "nm": True,
-                                       "mb": False}, "movie", "tt1375666")
+                                       "mb_file": False}, "movie", "tt1375666")
         self.assertEqual([c["name"] for c in out["streams"]],
                          ["▶️ VA · Server 1", "NM card"])
 
@@ -156,7 +168,7 @@ class MergeTests(unittest.TestCase):
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=[]) as nm:
             out = addon.build_streams({"va": True, "nm": False,
-                                       "mb": False}, "movie", "tt1")
+                                       "mb_file": False}, "movie", "tt1")
             va.assert_called_once()
             nm.assert_not_called()
         self.assertEqual(out["streams"], [])
@@ -168,7 +180,7 @@ class MergeTests(unittest.TestCase):
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=nm):
             out = addon.build_streams({"va": False, "nm": True,
-                                       "mb": False}, "movie", "tt2")
+                                       "mb_file": False}, "movie", "tt2")
         self.assertTrue(out["streams"][0]["url"].startswith("https://"))
 
     def test_empty_message_mentions_notes(self):
@@ -176,7 +188,7 @@ class MergeTests(unittest.TestCase):
              mock.patch.object(addon.nm_core, "streams_for_tt",
                                return_value=[]):
             out = addon.build_streams({"va": True, "nm": True,
-                                       "mb": False}, "movie", "tt0")
+                                       "mb_file": False}, "movie", "tt0")
         self.assertIn("VA", out["message"])
         self.assertIn("NetMirror", out["message"])
 
@@ -210,9 +222,37 @@ class MovieBoxMergeTests(unittest.TestCase):
                                return_value=[]), \
              mock.patch.object(addon.mb_core, "build_streams") as mbc:
             out = addon.build_streams({"va": False, "nm": True,
-                                       "mb": False}, "movie", "tt1")
+                                       "mb_hls": False, "mb_file": False},
+                                      "movie", "tt1")
             mbc.assert_not_called()
         self.assertEqual(out["streams"], [])
+
+    def test_mb_hls_file_split(self):
+        mb = {"streams": [
+            {"name": "♧ FHD 1080p ✹ X",
+             "url": "/hls/123/0/0/master.m3u8"},
+            {"name": "♧ HD 720p ✹ X",
+             "url": "https://bcdn.example/f/a.mp4?sign=1"},
+        ]}
+        with mock.patch.object(addon, "va_streams", return_value=[]), \
+             mock.patch.object(addon.nm_core, "streams_for_tt",
+                               return_value=[]), \
+             mock.patch.object(addon.mb_core, "build_streams",
+                               return_value=mb):
+            both = addon.build_streams(
+                {"va": False, "nm": False, "mb_hls": True, "mb_file": True},
+                "movie", "tt1", host_base="https://vnh.example")
+            self.assertEqual(len(both["streams"]), 2)
+            only_file = addon.build_streams(
+                {"va": False, "nm": False, "mb_hls": False, "mb_file": True},
+                "movie", "tt1")
+            self.assertEqual([c["url"] for c in only_file["streams"]],
+                             ["https://bcdn.example/f/a.mp4?sign=1"])
+            only_hls = addon.build_streams(
+                {"va": False, "nm": False, "mb_hls": True, "mb_file": False},
+                "movie", "tt1")
+            self.assertEqual(len(only_hls["streams"]), 1)
+            self.assertIn("/hls/", only_hls["streams"][0]["url"])
 
     def test_mb_error_is_honest_note_not_crash(self):
         with mock.patch.object(addon, "va_streams", return_value=[]), \
