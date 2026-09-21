@@ -2384,10 +2384,12 @@ _H5_WEB = "https://h5.aoneroom.com"
 _H5_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 _H5_SPOOF = "103.241.224.%d" % random.randint(1, 254)
-_LAST_H5_REF = ["?"]            # which web-front referer minted last
-# v1.9.18: the CDN referer MovieBox-Tui (2.1k-star working client) sends
-# with every stream — NOT the unblocked-web page referer
-STREAM_REFERER = "https://sportslive.wine"
+# v1.9.19: the file-CDN referer gate WHITELISTS the platform's own web
+# sites — measured live: Referer movieboxonline.net / netnaija.film =>
+# 426 (referer PASS, datacenter-IP block), any other referer / none =>
+# 429 (referer-blocked).  sportslive.wine (MovieBox-Tui's) fails the
+# gate from datacenter IPs too.
+STREAM_REFERER = "https://movieboxonline.net"
 _H5_DP_CACHE = {}
 
 
@@ -3382,10 +3384,12 @@ class Handler(BaseHTTPRequestHandler):
                     u = cards[0]["url"]
                     probe = {}
                     for label, hh in (
-                            ("with_referer", {"Referer":
-                                             "https://fmoviesunblocked.net/",
-                                             "Origin":
-                                             "https://fmoviesunblocked.net"}),
+                            ("mboxonline_ref", {"Referer":
+                                                "https://movieboxonline.net",
+                                                "Origin":
+                                                "https://movieboxonline.net"}),
+                            ("sportslive_ref", {"Referer":
+                                                "https://sportslive.wine"}),
                             ("no_referer", {})):
                         try:
                             t0 = time.time()
