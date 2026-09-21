@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.14"
+VERSION   = "1.9.15"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -551,16 +551,30 @@ _HOST_STICKY = [None]            # last host that answered code=0
 _HOST_BAD = {}                   # host -> benched-until timestamp
 
 
+_HOST_MS = {}          # v1.9.15: host -> ewma latency ms (race winners lead)
+
+
+def _host_note_ms(base, ms):
+    with _HOST_LOCK:
+        prev = _HOST_MS.get(base)
+        _HOST_MS[base] = ms if prev is None else prev * 0.7 + ms * 0.3
+
+
 def _api_hosts():
-    """API_HOSTS reordered: benched hosts skipped, sticky host first."""
+    """API_HOSTS reordered: benched hosts skipped, sticky host first,
+    then the rest fastest-measured-first (v1.9.15 race telemetry)."""
     now = time.time()
     with _HOST_LOCK:
         bad = {h for h, t in _HOST_BAD.items() if t > now}
         sticky = _HOST_STICKY[0]
+        ms = dict(_HOST_MS)
     hosts = [h for h in API_HOSTS if h not in bad] or list(API_HOSTS)
     if sticky in hosts:
         hosts.remove(sticky)
         hosts.insert(0, sticky)
+    if len(hosts) > 2:
+        tail = sorted(hosts[1:], key=lambda h: ms.get(h, 9e9))
+        hosts = hosts[:1] + tail
     return hosts
 
 
@@ -777,6 +791,89 @@ def _bootstrap_token():
     except Exception:
         pass
 
+
+_RACE_K = int(os.environ.get("MOVIEBOX_RACE_K", "4"))
+_RACE_ON = os.environ.get("MOVIEBOX_RACE", "1") != "0"
+
+
+def _race_direct(method, path, body, timeout, left):
+    """v1.9.15 MULTI-API RACE — the MovieBox platform has MANY api hosts;
+    the first wave fires at the top-K concurrently and whichever answers
+    a valid payload FIRST wins (phisher/CNC CloudStream style: what is
+    shown is whatever is fastest).  The winner's latency is remembered
+    and it leads the queue next call.  Direct-egress mode only — pool/
+    scrape.do/flagged-IP calls keep the classic sequential path.  Returns
+    (data|None, base|None); (None, None) = race found nothing, fall
+    through to the classic rotation."""
+    if not _RACE_ON or _PLAT_PROXIES:
+        return None, None
+    hosts = _api_hosts()[:_RACE_K]
+    if len(hosts) < 2 or not _AUTH_TOKEN:
+        return None, None
+    ts = int(time.time() * 1000)
+    headers = {
+        "User-Agent": UA_APP,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Client-Token": _x_client_token(ts),
+        "x-tr-signature": _x_tr_signature(method, hosts[0] + path, body, ts),
+        "X-Client-Info": _client_info(),
+        "X-Client-Status": "0",
+        "X-M-Version": "11.7.0",
+        "X-Forwarded-For": "103.241.224.%d" % random.randint(1, 254),
+        "Authorization": "Bearer " + _AUTH_TOKEN,
+    }
+    dl = timeout if left is None else min(timeout, max(0.5, left))
+    t0 = time.time()
+    end = t0 + dl
+    result = {}
+
+    def _fire(base):
+        try:
+            result[base] = requests.request(
+                method, base + path, headers=headers,
+                data=body.encode() if body else None, timeout=dl)
+        except Exception as exc:
+            result[base] = exc
+
+    ex = ThreadPoolExecutor(max_workers=len(hosts))
+    futs = {ex.submit(_fire, b): b for b in hosts}
+    pending = set(futs)
+    try:
+        while pending and time.time() < end:
+            done, pending = wait(pending, timeout=max(0.1, end - time.time()),
+                                 return_when=FIRST_COMPLETED)
+            for f in done:
+                base = futs[f]
+                r = result.get(base)
+                if isinstance(r, Exception):
+                    _host_note_bad(base)
+                    continue
+                ms = (time.time() - t0) * 1000.0
+                if r.status_code != 200:
+                    if r.status_code in (401, 403, 406):
+                        _host_note_bad(base)
+                    continue
+                try:
+                    d = r.json()
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if d.get("code") == 0:
+                    _host_note_ok(base)
+                    _host_note_ms(base, ms)
+                    _note_plat(True)
+                    _absorb_token(r)
+                    return d.get("data") or {}, base
+                msg = str(d.get("message") or d.get("reason") or "api")
+                if _AUTH_ERR_RE.search(msg):
+                    continue          # token trouble: classic path reauths
+                return {"__error__": msg}, base
+    finally:
+        ex.shutdown(wait=False)
+    return None, None
+
 def api_call(method, path, body=None, timeout=10):
     """Signed platform call with host rotation + 1 retry. Returns dict|None.
     None => transient failure (never cached by callers)."""
@@ -808,6 +905,11 @@ def api_call(method, path, body=None, timeout=10):
     elif not _direct_auth_ok() and _pool_all():
         fb = "pool"    # v1.7.5: direct egress auth-flagged — ride the pool
     rode_pool = False          # circuit breaker must not trip on proxy fails
+    # v1.9.15: the first wave RACES the top-K hosts (fastest answer wins)
+    if fb is None and _direct_auth_ok() and not _sd_forced(path):
+        _rdata, _rbase = _race_direct(method, path, body, timeout, left)
+        if _rdata is not None:
+            return _rdata
     for attempt in (1, 2):
         for base in (API_HOSTS[:1] if fb == "sd" else _api_hosts()):
             # v1.7.8: per-call wall — bound the host-rotation grind even on
@@ -2400,9 +2502,38 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
                 best[fname] = (rr, u, int(s.get("size") or 0))
     except Exception:
         pass
+    # v1.9.15 CloudStream-style test-then-show: 2-byte probe of every
+    # candidate concurrently; definitive-dead (403/404/410) dropped, the
+    # rest ordered FASTEST-CDN-FIRST.  Unprovable URLs (throttled probe
+    # IPs) stay, ranked last — they often still play from residential.
+    fh = {"Referer": "https://fmoviesunblocked.net/",
+          "Origin": "https://fmoviesunblocked.net",
+          "User-Agent": _H5_UA}
+    cands = sorted(best.items(), key=lambda kv: -kv[1][0])
+
+    def _probe(item):
+        fname, (rr, u, size) = item
+        t0 = time.time()
+        try:
+            r = requests.get(u, headers=dict(fh, Range="bytes=0-1"),
+                             timeout=5, stream=True)
+            r.close()
+            return (rr, u, size, r.status_code,
+                    (time.time() - t0) * 1000.0)
+        except Exception:
+            return (rr, u, size, 0, 9999.0)
+
+    probed = []
+    with ThreadPoolExecutor(max_workers=6) as exp:
+        probed = list(exp.map(_probe, cands))
+    live = [(rr, u, size, ms) for (rr, u, size, st, ms) in probed
+            if st in (200, 206)]
+    soft = [(rr, u, size, 8000.0 + i) for i, (rr, u, size, st, ms)
+            in enumerate(probed) if st not in (200, 206, 403, 404, 410)]
+    ranked = sorted(live + soft, key=lambda t: t[3])
+
     cards = []
-    for fname, (rr, u, size) in sorted(best.items(),
-                                              key=lambda kv: -kv[1][0]):
+    for rr, u, size, _ms in ranked:
         res_str = _ql_label("%dp" % rr) if rr else "HLS"
         cards.append({
             "name": "♧ %s  ✹ %s" % (res_str, title),
@@ -2412,11 +2543,12 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
                                           via="File CDN"),
             "url": u,
             "behaviorHints": {"notWebReady": False, "isBingeable": True,
-                              "filename": "stream.mp4"},
+                              "filename": "stream.mp4",
+                              "proxyHeaders": {"request": dict(fh)}},
             "bingeGroup": "mbxr|%s:%s:%s|%s" % (
                 title, "", "", label),
         })
-    _cache_put(_RES_CACHE, key, cards or None, 3600 if cards else 600)
+    _cache_put(_RES_CACHE, key, cards or None, 1800 if cards else 600)
     return cards
 
 
