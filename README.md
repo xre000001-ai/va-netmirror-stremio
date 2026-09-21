@@ -47,6 +47,7 @@ Config vars: `TMDB_KEY`, `MB_SECRET_KEY` (env/config only — no keys in the rep
   added; mb pool/token machinery boots with the addon.
 - Legacy 2-key config tokens keep working (MovieBox defaults ON).
 - Security: mb_core keys moved to env (`TMDB_KEY`, `MB_SECRET_KEY`).
+- Env: `MOVIEBOX_WEB_MP4=1` in prod — header-free signed web-MP4 cards so Stremio Web has a playable option (edge-HLS segments are Cookie-scoped by the platform).
 
 ### v1.0.1
 - Security: TMDB key read from `TMDB_KEY` env/config (public-repo key policy).
