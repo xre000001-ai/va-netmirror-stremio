@@ -1,1 +1,1 @@
-requests>=2.31
+requests[socks]>=2.31.0
