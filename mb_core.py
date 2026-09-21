@@ -50,11 +50,11 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.15"
+VERSION   = "1.9.17a"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
-TMDB_API_KEY = os.environ.get("TMDB_KEY", os.environ.get("TMDB_API_KEY", ""))   # env/config only (repo key policy)
+TMDB_API_KEY = os.environ.get("TMDB_KEY", os.environ.get("TMDB_API_KEY", ""))
 # Optional egress rotation (v1.6.4): set MOVIEBOX_PROXY to a proxy URL —
 # typically a *rotating residential gateway* like
 # "http://user:pass@gate.provider.tld:7000" — and every platform-API call
@@ -535,7 +535,7 @@ def _sd_fetch(method, url, headers, body, timeout=45):
 
 UA_APP = ("com.community.oneroom/50020042 (Linux; U; Android 13; en_US; Redmi; "
           "Build/TQ2A.230405.003; Cronet/135.0.7012.3)")
-SECRET_KEY = os.environ.get("MB_SECRET_KEY", "")   # platform x-tr-sign key via env/config (repo key policy)
+SECRET_KEY = os.environ.get("MB_SECRET_KEY", "")
 API_HOSTS = ["https://api6.aoneroom.com", "https://api5.aoneroom.com",
              "https://api4.aoneroom.com", "https://api3.aoneroom.com",
              "https://api4sg.aoneroom.com", "https://api6sg.aoneroom.com",
@@ -2352,6 +2352,7 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
     else:
         hls_cookie = None
     card = {
+        "_api": "mobile-hls",
         "name": card_name,
         "description": _fmt_card_desc(ran, codec, _fmt_size(pl.get("size")),
                                       _fmt_dur(pl.get("duration")),
@@ -2430,6 +2431,22 @@ def _h5_detail_path(sid):
     return dp
 
 
+def _unwrap(j):
+    """H5 payloads are sometimes {data:{data:{...}}}" — flatten to the
+    innermost dict merged over the outer (module-level: /debug/apis uses
+    it too)."""
+    if not isinstance(j, dict):
+        return {}
+    d = j.get("data")
+    if isinstance(d, dict):
+        if isinstance(d.get("data"), dict):
+            d = d["data"]
+        merged = dict(j)
+        merged.update(d)
+        return merged
+    return j
+
+
 def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     """v1.9.14: REAL per-title file cards from the platform's H5 gateway
     (the unblocked-web BFF — Bearer + Referer gated, NO Edge-Cache
@@ -2460,18 +2477,6 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     # (generic site referer -> code 0 with empty downloads)
     H["Referer"] = ("https://fmoviesunblocked.net/spa/videoPlayPage/movies/"
                     "%s?id=%s&type=/movie/detail" % (dp, sid))
-    def _unwrap(j):
-        if not isinstance(j, dict):
-            return {}
-        d = j.get("data")
-        if isinstance(d, dict):
-            if isinstance(d.get("data"), dict):
-                d = d["data"]
-            merged = dict(j)
-            merged.update(d)
-            return merged
-        return j
-
     best = {}                       # base_url -> (res, url, size)
     try:
         rd = requests.get(_H5_API + "/wefeed-h5api-bff/subject/download"
@@ -2536,6 +2541,7 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     for rr, u, size, _ms in ranked:
         res_str = _ql_label("%dp" % rr) if rr else "HLS"
         cards.append({
+            "_api": "h5-dl",
             "name": "♧ %s  ✹ %s" % (res_str, title),
             "description": _fmt_card_desc("%dp" % rr if rr else "HLS", "",
                                           _fmt_size(size), None,
@@ -2548,6 +2554,9 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
             "bingeGroup": "mbxr|%s:%s:%s|%s" % (
                 title, "", "", label),
         })
+    for c in cards:
+        if "tran-audio" in (c.get("url") or ""):
+            c["_api"] = "h5-play"
     _cache_put(_RES_CACHE, key, cards or None, 1800 if cards else 600)
     return cards
 
@@ -2575,6 +2584,7 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
     for res_i, url, size, codec, dur in st:
         cl = _CODEC_LABEL.get((codec or "").lower())
         cards.append({
+            "_api": "webmp4",
             "name": "♧ %dp  ✹ %s" % (res_i, title),   # v1.9.9: no dub bracket
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
@@ -2989,6 +2999,97 @@ def _bg_refresh(ctype, imdb, se, ep, key):
 # HTTP server
 # --------------------------------------------------------------------------
 
+# ---------------- v1.9.16: user config page (choose your paths) ----------
+_CFG_DEFAULTS = {"hls": True, "h5dl": True, "h5play": True, "web": True}
+
+
+def _cfg_encode(cfg):
+    return base64.urlsafe_b64encode(
+        json.dumps(cfg, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def _cfg_decode(tok):
+    try:
+        pad = "=" * (-len(tok) % 4)
+        cfg = json.loads(base64.urlsafe_b64decode(tok + pad).decode())
+        if not isinstance(cfg, dict):
+            return None
+        return {k: bool(cfg.get(k, True)) for k in _CFG_DEFAULTS}
+    except Exception:
+        return None
+
+
+def _cfg_filter(res, cfg):
+    """v1.9.17: per-API selection — every card carries `_api`:
+      mobile-hls — the cookie DASH→HLS ladder (series + quality menu)
+      h5-dl      — H5-gateway signed download MP4s (bcdnw, 360p-1080p)
+      h5-play    — the official web player's 1080p tran-audio MP4
+      webmp4     — web-catalog signed MP4s
+    Unknown/untagged cards pass untouched (future-proof)."""
+    tag2key = {"mobile-hls": "hls", "h5-dl": "h5dl",
+               "h5-play": "h5play", "webmp4": "web"}
+    streams = []
+    for c in (res.get("streams") or []):
+        api = c.get("_api")
+        if api is None:
+            u = c.get("url") or ""
+            api = "mobile-hls" if ("/hls/" in u or u.endswith(".mpd")) \
+                else None
+        key = tag2key.get(api)
+        if key is None or cfg.get(key, True):
+            streams.append(c)
+    out = {"streams": streams}
+    if not streams and res.get("message"):
+        out["message"] = res["message"]
+    return out
+
+
+_MB_CONFIG_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MovieBox — configure</title>
+<style>
+body{background:#0b0f17;color:#e8ecf4;font-family:system-ui,sans-serif;
+max-width:640px;margin:36px auto;padding:0 20px;line-height:1.55}
+h1{font-size:26px} small{color:#8ea0b5}
+.src{background:#111a27;border:1px solid #223047;border-radius:12px;
+padding:14px 18px;margin:12px 0;display:flex;gap:12px;align-items:center}
+.src b{font-size:16px} .src p{margin:2px 0 0;color:#9fb2c6;font-size:13px}
+button{background:#e50914;color:#fff;border:0;border-radius:10px;
+padding:13px 26px;font-weight:700;font-size:16px;cursor:pointer;margin-top:8px}
+</style></head><body>
+<h1>♣ MovieBox <small>v__VER__ — choose your paths</small></h1>
+<p>Tick the stream paths you want. Everything stays ON by default —
+nothing is removed; this only filters what shows in your player.</p>
+<div class="src"><input type="checkbox" id="hls" checked>
+ <div><b>1 · Mobile API → HLS ladder</b>
+ <p>api3-6.aoneroom hosts (multi-API race). Quality menu 240p–1080p + dubs
+ + SERIES. Cookie-scoped — needs Stremio desktop/app or Nuvio. The
+ original path, stays available.</p></div></div>
+<div class="src"><input type="checkbox" id="h5dl" checked>
+ <div><b>2 · H5 API → Download MP4 <small>(fast)</small></b>
+ <p>h5-api.aoneroom unblocked-web gateway, per-dub 360p–1080p signed MP4s
+ (bcdnw) — the same files the MovieBox app downloads. Movies.</p></div></div>
+<div class="src"><input type="checkbox" id="h5play" checked>
+ <div><b>3 · H5 API → Play 1080p MP4 <small>(fast)</small></b>
+ <p>The exact 1080p MP4 the official WEB player streams (bcdnxw
+ tran-audio). One card per dub. Movies.</p></div></div>
+<div class="src"><input type="checkbox" id="web" checked>
+ <div><b>4 · Web catalog → MP4</b>
+ <p>The site's own web-player mapping, per-resolution signed MP4s.
+ Movie-heavy, header-free.</p></div></div>
+<button onclick="install()">Install in Stremio</button>
+<p id="link" style="margin-top:14px"></p>
+<p><small>Cards are direct provider links — the addon relays no media.
+Your choice travels inside the install URL; reconfigure any time.</small></p>
+<script>
+function tok(){const c={hls:document.getElementById('hls').checked,
+h5dl:document.getElementById('h5dl').checked,
+h5play:document.getElementById('h5play').checked,
+web:document.getElementById('web').checked};
+let b=btoa(JSON.stringify(c)).replace(/=+$/,'');return b}
+function install(){location.href='/cfg-'+tok()+'/manifest.json'}
+</script></body></html>""".replace("__VER__", VERSION)
+
 MANIFEST = {
     "id": "com.movbox.stremio",
     "version": VERSION,
@@ -2999,7 +3100,8 @@ MANIFEST = {
     "types": ["movie", "series"],
     "idPrefixes": ["tt"],
     "logo": "/logo.png",
-    "behaviorHints": {"configurable": False},
+    "behaviorHints": {"configurable": True,
+                      "configurationURL": "/configure"},
     # v1.8.0 (user directive): STREAM-ONLY. No catalogs — the addon now
     # supplies streams for whatever the user opens from their own catalogs
     # (IMDb, Trakt, ...), Torrentio-style. Less platform volume at boot
@@ -3216,6 +3318,89 @@ class Handler(BaseHTTPRequestHandler):
         # EVERY series stream request 404s while movies work fine.
         path, q = unquote(u.path), parse_qs(u.query)
 
+        # v1.9.16: optional /cfg-<tok>/ prefix — user's configure-page
+        # selection rides the install URL and filters card families
+        self._cfg = dict(_CFG_DEFAULTS)
+        if path.startswith("/cfg-"):
+            tok, _, rest = path[5:].partition("/")
+            c = _cfg_decode(tok)
+            if c:
+                self._cfg = c
+                path = "/" + rest if rest else "/"
+
+        if path == "/debug/apis":
+            """v1.9.17: live census of every MovieBox API path — which are
+            alive RIGHT NOW, latency, and whether the file hosts need the
+            Referer header (probed from THIS server's IP)."""
+            out = {"t": time.strftime("%H:%M:%S"), "apis": {}}
+            # 1) mobile API (race-ordered): one real signed call
+            t0 = time.time()
+            d = api_call("GET", "/wefeed-mobile-bff/subject-api/get"
+                         "?subjectId=977486567826752424&update=0&status=0",
+                         timeout=8)
+            out["apis"]["mobile"] = {
+                "ok": bool(d) and "__error__" not in d,
+                "ms": int((time.time() - t0) * 1000),
+                "host_latencies_ms": {k.split("//")[1]: round(v)
+                                      for k, v in sorted(
+                                          _HOST_MS.items(),
+                                          key=lambda kv: kv[1])},
+                "healthy_hosts": [h.split("//")[1] for h in _api_hosts()[:3]],
+            }
+            # 2) H5 gateway: token + download + play (real calls)
+            H = _h5_headers()
+            dp = _h5_detail_path("6391474290696802080")
+            h5 = {"token": bool(H.get("Authorization")), "detailPath": bool(dp)}
+            if dp and H.get("Authorization"):
+                try:
+                    t0 = time.time()
+                    rd = requests.get(
+                        _H5_API + "/wefeed-h5api-bff/subject/download"
+                        "?subjectId=6391474290696802080&detailPath=%s" % dp,
+                        headers=H, timeout=8)
+                    dj = _unwrap(rd.json())
+                    dls = dj.get("downloads") or []
+                    h5["download_files"] = len(
+                        [x for x in dls if x.get("url")
+                         and not x.get("vipLocked")])
+                    h5["ms"] = int((time.time() - t0) * 1000)
+                except Exception as exc:
+                    h5["err"] = str(exc)[:80]
+            out["apis"]["h5"] = h5
+            # 3) file-host referer probe (from THIS IP): mint one URL and
+            # fetch bytes=0-1 with and without the Referer header
+            try:
+                cards = _resource_cards("6391474290696802080", "Inception",
+                                        "movie", 1, 1)
+                if cards:
+                    u = cards[0]["url"]
+                    probe = {}
+                    for label, hh in (
+                            ("with_referer", {"Referer":
+                                             "https://fmoviesunblocked.net/",
+                                             "Origin":
+                                             "https://fmoviesunblocked.net"}),
+                            ("no_referer", {})):
+                        try:
+                            t0 = time.time()
+                            rr = requests.get(
+                                u, timeout=8, stream=True,
+                                headers={**{"User-Agent": _H5_UA,
+                                            "Range": "bytes=0-1"}, **hh})
+                            rr.close()
+                            probe[label] = {"status": rr.status_code,
+                                            "ms": int((time.time()-t0)*1000)}
+                        except Exception as exc:
+                            probe[label] = {"err": type(exc).__name__}
+                    out["apis"]["file_host"] = {
+                        "host": u.split("/")[2], "probe": probe}
+            except Exception as exc:
+                out["apis"]["file_host"] = {"err": str(exc)[:80]}
+            return self._send(200, json.dumps(out))
+
+        if path == "/configure":
+            return self._send(200, _MB_CONFIG_PAGE,
+                              "text/html; charset=utf-8")
         if path == "/health":
             return self._send(200, json.dumps({
                 "ok": True, "version": VERSION, "brand": BRAND,
@@ -3451,6 +3636,7 @@ class Handler(BaseHTTPRequestHandler):
             for s in res.get("streams") or []:
                 if s.get("url", "").startswith("/hls/"):
                     s["url"] = base + s["url"]
+            res = _cfg_filter(res, self._cfg)
             return self._send(200, json.dumps(res))
 
         # v1.9.4: quality-menu HLS layer — ONLY master/variant playlist
