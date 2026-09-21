@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.17a"
+VERSION   = "1.9.18"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -539,7 +539,9 @@ SECRET_KEY = os.environ.get("MB_SECRET_KEY", "")
 API_HOSTS = ["https://api6.aoneroom.com", "https://api5.aoneroom.com",
              "https://api4.aoneroom.com", "https://api3.aoneroom.com",
              "https://api4sg.aoneroom.com", "https://api6sg.aoneroom.com",
-             "https://api.inprovider.com"]
+             "https://api.inprovider.com",
+             # v1.9.18: MovieBox-Tui's pool + the 4.0.02 APK's hosts
+             "https://api.inmoviebox.com", "https://api7.aoneroom.com"]
 
 # v1.7.7: direct-host health. api_call used to walk ALL 7 hosts per
 # attempt (a sick host = its full timeout, several sick hosts = 10s+ for
@@ -2382,6 +2384,9 @@ _H5_WEB = "https://h5.aoneroom.com"
 _H5_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 _H5_SPOOF = "103.241.224.%d" % random.randint(1, 254)
+# v1.9.18: the CDN referer MovieBox-Tui (2.1k-star working client) sends
+# with every stream — NOT the unblocked-web page referer
+STREAM_REFERER = "https://sportslive.wine"
 _H5_DP_CACHE = {}
 
 
@@ -2511,9 +2516,9 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     # candidate concurrently; definitive-dead (403/404/410) dropped, the
     # rest ordered FASTEST-CDN-FIRST.  Unprovable URLs (throttled probe
     # IPs) stay, ranked last — they often still play from residential.
-    fh = {"Referer": "https://fmoviesunblocked.net/",
-          "Origin": "https://fmoviesunblocked.net",
-          "User-Agent": _H5_UA}
+    fh = {"Referer": STREAM_REFERER,
+          "Origin": STREAM_REFERER,
+          "User-Agent": UA_APP}
     cands = sorted(best.items(), key=lambda kv: -kv[1][0])
 
     def _probe(item):
