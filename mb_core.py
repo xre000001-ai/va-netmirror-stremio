@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.18"
+VERSION   = "1.9.19"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2384,6 +2384,7 @@ _H5_WEB = "https://h5.aoneroom.com"
 _H5_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 _H5_SPOOF = "103.241.224.%d" % random.randint(1, 254)
+_LAST_H5_REF = ["?"]            # which web-front referer minted last
 # v1.9.18: the CDN referer MovieBox-Tui (2.1k-star working client) sends
 # with every stream — NOT the unblocked-web page referer
 STREAM_REFERER = "https://sportslive.wine"
