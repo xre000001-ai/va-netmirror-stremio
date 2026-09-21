@@ -52,7 +52,7 @@ def _mb_boot():
 _mb_boot()
 
 # ------------------------------------------------------------------ 1 config
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BRAND = "VA × NetMirror"
 PORT = int(os.environ.get("PORT", "7000"))
 VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")
@@ -63,7 +63,8 @@ VA_API = "https://streamdata.vaplayer.ru/api.php"
 VA_ORIGIN = "https://nextgencloudfabric.com"
 VA_TIMEOUT = 12.0
 
-DEFAULTS = {"va": True, "nm": True, "mb_hls": True, "mb_file": True}
+DEFAULTS = {"va": True, "nm": True, "mb_hls": True, "mb_h5dl": True,
+            "mb_h5play": True, "mb_web": True}
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": UA})
@@ -92,8 +93,9 @@ MANIFEST_BASE = {
 def manifest_for(cfg):
     m = dict(MANIFEST_BASE)
     on = [n for n, key in (
-              ("▶️ VA Player", "va"), ("🎬 NetMirror", "nm"),
-              ("📦 MB HLS", "mb_hls"), ("📦 MB File", "mb_file"))
+              ("▶️ VA", "va"), ("🎬 NM", "nm"), ("📦 MB-HLS", "mb_hls"),
+              ("📦 MB-DL", "mb_h5dl"), ("📦 MB-1080", "mb_h5play"),
+              ("📦 MB-Web", "mb_web"))
           if cfg.get(key)]
     m["description"] = ("Sources: %s. Open any movie or series from your "
                         "catalogs — direct native-HLS streams appear. "
@@ -119,13 +121,25 @@ def decode_cfg(token):
             return None
         out = {"va": bool(cfg.get("va", True)),
                "nm": bool(cfg.get("nm", True))}
-        if "mb_hls" in cfg or "mb_file" in cfg:
+        if "mb_h5dl" in cfg or "mb_h5play" in cfg or "mb_web" in cfg:
+            # v1.3.0 granular: each MovieBox API separately
             out["mb_hls"] = bool(cfg.get("mb_hls", True))
-            out["mb_file"] = bool(cfg.get("mb_file", True))
+            out["mb_h5dl"] = bool(cfg.get("mb_h5dl", True))
+            out["mb_h5play"] = bool(cfg.get("mb_h5play", True))
+            out["mb_web"] = bool(cfg.get("mb_web", True))
+        elif "mb_file" in cfg:
+            # v1.2.0 token: mb_file covered all three file APIs
+            f = bool(cfg.get("mb_file", True))
+            out["mb_hls"] = bool(cfg.get("mb_hls", True))
+            out["mb_h5dl"] = f
+            out["mb_h5play"] = f
+            out["mb_web"] = f
         else:
             mb = bool(cfg.get("mb", True))
             out["mb_hls"] = mb
-            out["mb_file"] = mb
+            out["mb_h5dl"] = mb
+            out["mb_h5play"] = mb
+            out["mb_web"] = mb
         return out
     except Exception:
         return None
@@ -228,7 +242,8 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None,
         if not nm_core.streams_for_tt_cached_lenient(
                 media_type, identifier, season, episode):
             notes.append("NetMirror: nothing found")
-    if cfg.get("mb_hls") or cfg.get("mb_file"):
+    if any(cfg.get(k) for k in ("mb_hls", "mb_h5dl", "mb_h5play",
+                                "mb_web")):
         try:
             mbres = mb_core.build_streams(
                 media_type, identifier,
@@ -237,13 +252,18 @@ def build_streams(cfg, media_type, identifier, season=None, episode=None,
             # /stream route does res.get("streams")) — accept both shapes.
             mb = (mbres.get("streams") or []) \
                 if isinstance(mbres, dict) else (mbres or [])
-            # v1.2.0: per-path selection — "/hls/" cards are the cookie
-            # DASH ladder, everything else is a header-free file
-            want_hls = bool(cfg.get("mb_hls"))
-            want_file = bool(cfg.get("mb_file"))
-            if not (want_hls and want_file):
-                mb = [c for c in mb
-                      if ("/hls/" in (c.get("url") or "")) == want_hls]
+            # v1.3.0: per-API selection — mb_core tags every card
+            tagkey = {"mobile-hls": "mb_hls", "h5-dl": "mb_h5dl",
+                      "h5-play": "mb_h5play", "webmp4": "mb_web"}
+            picked = []
+            for c in mb:
+                key = tagkey.get(c.get("_api"))
+                if key is None:
+                    key = "mb_hls" if "/hls/" in (c.get("url") or "") \
+                        else "mb_h5dl"
+                if cfg.get(key, True):
+                    picked.append(c)
+            mb = picked
             for c in mb:
                 c = dict(c)
                 nm_label = c.get("name") or ""
@@ -303,11 +323,17 @@ reconfigure any time.</p>
  <div><b>🎬 NetMirror</b>
  <p>Netflix / Hotstar / Prime mirrors · multi-audio HLS + mp4, direct CDN</p></div></div>
 <div class="src"><input type="checkbox" id="mb_hls" checked>
- <div><b>📦 MovieBox · HLS ladder</b>
- <p>Quality menu (240p–1080p) + dubs · cookie-scoped DASH→HLS — works everywhere, slower CDN (the original path, stays ON)</p></div></div>
-<div class="src"><input type="checkbox" id="mb_file" checked>
- <div><b>📦 MovieBox · File MP4 <small>(fast)</small></b>
- <p>Signed MP4s from the H5 gateway — buffer-free, header-free, plays in Stremio Web too. Movies only.</p></div></div>
+ <div><b>📦 MB · API-1 HLS ladder</b>
+ <p>api3-6.aoneroom (multi-API race) · quality menu + dubs + SERIES · the original path, stays available</p></div></div>
+<div class="src"><input type="checkbox" id="mb_h5dl" checked>
+ <div><b>📦 MB · API-2 Download MP4 <small>(fast)</small></b>
+ <p>H5 gateway per-dub 360p–1080p signed MP4s (bcdnw) — the app's own download files. Movies.</p></div></div>
+<div class="src"><input type="checkbox" id="mb_h5play" checked>
+ <div><b>📦 MB · API-3 Play-1080 MP4 <small>(fast)</small></b>
+ <p>The exact 1080p MP4 the official web player streams (bcdnxw). Movies.</p></div></div>
+<div class="src"><input type="checkbox" id="mb_web" checked>
+ <div><b>📦 MB · API-4 Web MP4</b>
+ <p>Web-catalog per-resolution signed MP4s, header-free. Movies.</p></div></div>
 <button onclick="install()">Install in Stremio</button>
 <p id="link" style="margin-top:14px"></p>
 <p><small>Cards are direct provider links — the addon relays no media.
@@ -316,7 +342,9 @@ Configure = choose sources; the choice travels inside the install URL.</small></
 function tok(){const c={va:document.getElementById('va').checked,
 nm:document.getElementById('nm').checked,
 mb_hls:document.getElementById('mb_hls').checked,
-mb_file:document.getElementById('mb_file').checked};
+mb_h5dl:document.getElementById('mb_h5dl').checked,
+mb_h5play:document.getElementById('mb_h5play').checked,
+mb_web:document.getElementById('mb_web').checked};
 let b=btoa(JSON.stringify(c)).replace(/=+$/,'');return b}
 function install(){const t=tok();
 location.href='/cfg-'+t+'/manifest.json'}

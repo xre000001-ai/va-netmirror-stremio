@@ -37,40 +37,51 @@ class FakeResponse:
 
 class TokenTests(unittest.TestCase):
     def test_roundtrip_defaults(self):
-        t = addon.encode_cfg({"va": True, "nm": True,
-                              "mb_hls": True, "mb_file": False})
+        t = addon.encode_cfg({"va": True, "nm": True, "mb_hls": True,
+                              "mb_h5dl": False, "mb_h5play": False,
+                              "mb_web": False})
         self.assertEqual(addon.decode_cfg(t),
-                         {"va": True, "nm": True,
-                          "mb_hls": True, "mb_file": False})
+                         {"va": True, "nm": True, "mb_hls": True,
+                          "mb_h5dl": False, "mb_h5play": False,
+                          "mb_web": False})
 
-    def test_legacy_two_key_token_gains_mb_default_on(self):
-        t = addon.encode_cfg({"va": False, "nm": True})   # pre-1.1.0 token
-        self.assertEqual(addon.decode_cfg(t),
-                         {"va": False, "nm": True,
-                          "mb_hls": True, "mb_file": True})
+    def test_legacy_tokens_map(self):
+        t2 = addon.encode_cfg({"va": False, "nm": True})   # pre-1.1.0
+        self.assertEqual(addon.decode_cfg(t2),
+                         {"va": False, "nm": True, "mb_hls": True,
+                          "mb_h5dl": True, "mb_h5play": True,
+                          "mb_web": True})
+        t3 = addon.encode_cfg({"va": True, "nm": True, "mb": False})
+        self.assertEqual(addon.decode_cfg(t3)["mb_h5dl"], False)
+        t12 = addon.encode_cfg({"va": True, "nm": True, "mb_hls": True,
+                                "mb_file": False})                 # v1.2.0
+        d = addon.decode_cfg(t12)
+        self.assertEqual((d["mb_hls"], d["mb_h5dl"], d["mb_h5play"],
+                          d["mb_web"]), (True, False, False, False))
 
     def test_legacy_three_key_mb_maps_to_both(self):
         t = addon.encode_cfg({"va": True, "nm": True, "mb": False})
-        self.assertEqual(addon.decode_cfg(t),
-                         {"va": True, "nm": True,
-                          "mb_hls": False, "mb_file": False})
+        d = addon.decode_cfg(t)
+        self.assertEqual((d["mb_hls"], d["mb_h5dl"], d["mb_h5play"],
+                          d["mb_web"]), (False, False, False, False))
 
     def test_partial_and_invalid(self):
         t = addon.encode_cfg({"va": True, "nm": False, "mb": False})
-        self.assertEqual(addon.decode_cfg(t),
-                         {"va": True, "nm": False,
-                          "mb_hls": False, "mb_file": False})
+        d = addon.decode_cfg(t)
+        self.assertEqual((d["va"], d["nm"], d["mb_hls"], d["mb_h5dl"],
+                          d["mb_h5play"], d["mb_web"]),
+                         (True, False, False, False, False, False))
         self.assertIsNone(addon.decode_cfg("!!!not-base64-json!!!"))
 
     def test_cfg_from_path(self):
         t = addon.encode_cfg({"va": False, "nm": True})
         cfg, rest = addon.cfg_from_path("/cfg-%s/stream/movie/tt1.json" % t)
-        self.assertEqual(cfg, {"va": False, "nm": True,
-                               "mb_hls": True, "mb_file": True})
+        self.assertEqual(cfg, {"va": False, "nm": True, "mb_hls": True,
+                               "mb_h5dl": True, "mb_h5play": True,
+                               "mb_web": True})
         self.assertEqual(rest, "/stream/movie/tt1.json")
         cfg2, rest2 = addon.cfg_from_path("/stream/movie/tt1.json")
-        self.assertEqual(cfg2, {"va": True, "nm": True,
-                                "mb_hls": True, "mb_file": True})
+        self.assertEqual(cfg2, dict(addon.DEFAULTS))
 
 
 class ManifestTests(unittest.TestCase):
@@ -78,8 +89,8 @@ class ManifestTests(unittest.TestCase):
         m = addon.manifest_for({"va": True, "nm": False})
         self.assertTrue(m["behaviorHints"]["configurable"])
         self.assertEqual(m["catalogs"], [])
-        self.assertIn("VA Player", m["description"])
-        self.assertNotIn("NetMirror:", m["description"].split("Sources: ")[1])
+        self.assertIn("VA", m["description"])
+        self.assertNotIn("NM", m["description"].split("Sources: ")[1])
 
     def test_base_fields(self):
         m = addon.MANIFEST_BASE
@@ -227,32 +238,40 @@ class MovieBoxMergeTests(unittest.TestCase):
             mbc.assert_not_called()
         self.assertEqual(out["streams"], [])
 
-    def test_mb_hls_file_split(self):
+    def test_mb_per_api_split(self):
         mb = {"streams": [
-            {"name": "♧ FHD 1080p ✹ X",
-             "url": "/hls/123/0/0/master.m3u8"},
+            {"name": "♧ FHD 1080p ✹ X", "url": "/hls/123/0/0/master.m3u8",
+             "_api": "mobile-hls"},
             {"name": "♧ HD 720p ✹ X",
-             "url": "https://bcdn.example/f/a.mp4?sign=1"},
+             "url": "https://bcdnw.example/f/a.mp4?sign=1",
+             "_api": "h5-dl"},
+            {"name": "♧ FHD 1080p ✹ X",
+             "url": "https://bcdnxw.example/t/f.mp4?sign=2",
+             "_api": "h5-play"},
+            {"name": "♧ 480p ✹ X",
+             "url": "https://bcdnxw.example/w/b.mp4?sign=3",
+             "_api": "webmp4"},
         ]}
-        with mock.patch.object(addon, "va_streams", return_value=[]), \
-             mock.patch.object(addon.nm_core, "streams_for_tt",
-                               return_value=[]), \
-             mock.patch.object(addon.mb_core, "build_streams",
-                               return_value=mb):
-            both = addon.build_streams(
-                {"va": False, "nm": False, "mb_hls": True, "mb_file": True},
-                "movie", "tt1", host_base="https://vnh.example")
-            self.assertEqual(len(both["streams"]), 2)
-            only_file = addon.build_streams(
-                {"va": False, "nm": False, "mb_hls": False, "mb_file": True},
-                "movie", "tt1")
-            self.assertEqual([c["url"] for c in only_file["streams"]],
-                             ["https://bcdn.example/f/a.mp4?sign=1"])
-            only_hls = addon.build_streams(
-                {"va": False, "nm": False, "mb_hls": True, "mb_file": False},
-                "movie", "tt1")
-            self.assertEqual(len(only_hls["streams"]), 1)
-            self.assertIn("/hls/", only_hls["streams"][0]["url"])
+        def run(cfg):
+            with mock.patch.object(addon, "va_streams", return_value=[]), \
+                 mock.patch.object(addon.nm_core, "streams_for_tt",
+                                   return_value=[]), \
+                 mock.patch.object(addon.mb_core, "build_streams",
+                                   return_value=mb):
+                return addon.build_streams(cfg, "movie", "tt1",
+                                           host_base="https://vnh.example")
+        allon = run({"va": False, "nm": False, "mb_hls": True,
+                     "mb_h5dl": True, "mb_h5play": True, "mb_web": True})
+        self.assertEqual(len(allon["streams"]), 4)
+        dl_only = run({"va": False, "nm": False, "mb_hls": False,
+                       "mb_h5dl": True, "mb_h5play": False, "mb_web": False})
+        self.assertEqual([c["name"] for c in dl_only["streams"]],
+                         ["📦 HD 720p ✹ X"])
+        hls_only = run({"va": False, "nm": False, "mb_hls": True,
+                        "mb_h5dl": False, "mb_h5play": False,
+                        "mb_web": False})
+        self.assertEqual(len(hls_only["streams"]), 1)
+        self.assertIn("/hls/", hls_only["streams"][0]["url"])
 
     def test_mb_error_is_honest_note_not_crash(self):
         with mock.patch.object(addon, "va_streams", return_value=[]), \
@@ -345,12 +364,12 @@ class ServerSmokeTests(unittest.TestCase):
                 return r.status, body
             st, body = get("/configure")
             self.assertEqual(st, 200)
-            self.assertIn(b"VA Player", body)
-            self.assertIn(b"MovieBox", body)
+            self.assertIn(b"VA Player", body)  # VA toggle label kept
+            self.assertIn("MB · API-1".encode(), body)
             t = addon.encode_cfg({"va": False, "nm": True, "mb": True})
             st, body = get("/cfg-%s/manifest.json" % t)
             m = json.loads(body)
-            self.assertIn("NetMirror", m["description"])
+            self.assertIn("NM", m["description"])
             st, body = get("/health")
             self.assertEqual(json.loads(body)["ok"], True)
             self.assertEqual(json.loads(body)["version"], addon.VERSION)
