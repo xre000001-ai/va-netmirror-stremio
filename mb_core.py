@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.13"
+VERSION   = "1.9.14"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2184,6 +2184,11 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
     WEB play API (signed URLs, no cookies) — one card per quality,
     ahead of the DASH card."""
     sid, label = pair
+    # v1.9.14: header-free signed file cards FIRST (universal playback:
+    # Stremio Web/desktop/Nuvio — no cookie, fast macdn/bcdnw hosts)
+    res_cards = _resource_cards(sid, title, ctype, se, ep, label=label,
+                                year=year) if _RESOURCE_ON else []
+    res_bases = {c["url"].split("?")[0] for c in res_cards}
     pi = _cached_play(sid, se if ctype == "series" else None,
                       ep if ctype == "series" else None)
     if not pi:
@@ -2191,12 +2196,16 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
         # transiently sick — try them before giving up on this dub
         web_cards = _web_cards_for(title, label, ctype, se, ep, sid, web_langs,
                                    year=year)
-        return web_cards or None
+        return (res_cards + [w for w in web_cards
+                             if w["url"].split("?")[0] not in res_bases]
+                ) or None
     pl = (pi.get("streams") or [None])[0]
     web_cards = _web_cards_for(title, label, ctype, se, ep, sid, web_langs,
                                year=year)
+    web_cards = [w for w in web_cards
+                 if w["url"].split("?")[0] not in res_bases]
     if not pl or not pl.get("signCookie"):
-        return web_cards or None
+        return (res_cards + web_cards) or None
     # v1.9.13: the play-info signCookie now arrives in the NEW Edge-Cache
     # scheme (urlprefix=<b64> base); keep supporting the legacy CloudFront
     # policy format so old cached entries keep working through the switch.
@@ -2259,7 +2268,156 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
                                               ep if ctype == "series" else "", label, res),
         "subtitles": subs,
     }
-    return web_cards + [card]
+    return res_cards + web_cards + [card]
+
+
+_RESOURCE_ON = os.environ.get("MOVIEBOX_RESOURCE", "1") != "0"
+_RES_CACHE = {}
+_H5_TOKEN = [None, 0.0]
+_H5_API = "https://h5-api.aoneroom.com"
+_H5_WEB = "https://h5.aoneroom.com"
+_H5_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+_H5_SPOOF = "103.241.224.%d" % random.randint(1, 254)
+_H5_DP_CACHE = {}
+
+
+def _h5_headers():
+    """Bearer token from the public app-pkg endpoint (no HMAC needed on
+    the H5 gateway) + the region spoof the platform's geo gate reads
+    (X-Forwarded-For in the 103.241.224.x range — otherwise 'invalid
+    region' from any datacenter IP)."""
+    if not _H5_TOKEN[0] or time.time() - _H5_TOKEN[1] > 1500:
+        try:
+            r = requests.get(
+                _H5_API + "/wefeed-h5api-bff/app/get-latest-app-pkgs"
+                "?app_name=moviebox",
+                headers={"User-Agent": _H5_UA}, timeout=8)
+            xu = r.headers.get("x-user", "")
+            _H5_TOKEN[0] = ((json.loads(xu) or {}).get("token")
+                            if xu else None)
+            _H5_TOKEN[1] = time.time()
+        except Exception:
+            pass
+    return {
+        "Authorization": "Bearer %s" % _H5_TOKEN[0] if _H5_TOKEN[0] else "",
+        "X-Client-Info": '{"timezone":"Africa/Nairobi"}',
+        "X-Forwarded-For": _H5_SPOOF,
+        "Accept": "application/json",
+        "Referer": "https://fmoviesunblocked.net/",
+        "Origin": "https://fmoviesunblocked.net",
+        "User-Agent": _H5_UA,
+    }
+
+
+def _h5_detail_path(sid):
+    key = str(sid)
+    hit, val = _cache_get(_H5_DP_CACHE, key)
+    if hit:
+        return val
+    dp = ""
+    try:
+        r = requests.get(_H5_WEB + "/wefeed-h5-bff/web/post/list/subject"
+                         "?id=%s" % sid,
+                         headers={"User-Agent": _H5_UA}, timeout=8)
+        dp = ((((r.json().get("data") or {}).get("items") or [{}])[0]
+               .get("subject") or {}).get("detailPath") or "")
+    except Exception:
+        dp = ""
+    _cache_put(_H5_DP_CACHE, key, dp or None, 86400)
+    return dp
+
+
+def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
+    """v1.9.14: REAL per-title file cards from the platform's H5 gateway
+    (the unblocked-web BFF — Bearer + Referer gated, NO Edge-Cache
+    cookie): downloads[] = signed progressive MP4s (bcdnw, header-free),
+    play.streams[] = the 1080p tran-audio MP4 the official web player
+    itself streams.  This is the exact family the MovieBox app, the
+    unblocked site and CineStream (megix) play buffer-free.  The mobile
+    subject-api/resource endpoint was tried first but returns a shared
+    0.9MB placeholder for every title — dead end, not used.  Series:
+    the H5 gateway exposes no episode files (verified GoT S1E1 = 0) so
+    this returns [] and the cookie-scoped HLS ladder stays the series
+    path."""
+    if ctype != "movie":
+        return []
+    key = ("h5", str(sid))
+    hit, val = _cache_get(_RES_CACHE, key)
+    if hit:
+        return val or []
+    dp = _h5_detail_path(sid)
+    if not dp:
+        _cache_put(_RES_CACHE, key, None, 600)
+        return []
+    H = _h5_headers()
+    if not H.get("Authorization"):
+        _cache_put(_RES_CACHE, key, None, 300)
+        return []
+    # the gateway ONLY answers with the exact SPA videoPlayPage referer
+    # (generic site referer -> code 0 with empty downloads)
+    H["Referer"] = ("https://fmoviesunblocked.net/spa/videoPlayPage/movies/"
+                    "%s?id=%s&type=/movie/detail" % (dp, sid))
+    def _unwrap(j):
+        if not isinstance(j, dict):
+            return {}
+        d = j.get("data")
+        if isinstance(d, dict):
+            if isinstance(d.get("data"), dict):
+                d = d["data"]
+            merged = dict(j)
+            merged.update(d)
+            return merged
+        return j
+
+    best = {}                       # base_url -> (res, url, size)
+    try:
+        rd = requests.get(_H5_API + "/wefeed-h5api-bff/subject/download"
+                          "?subjectId=%s&detailPath=%s" % (sid, dp),
+                          headers=H, timeout=10)
+        for d in (_unwrap(rd.json()).get("downloads") or []):
+            u = d.get("url") or ""
+            if not u or d.get("vipLocked"):
+                continue
+            fname = u.split("?")[0].rsplit("/", 1)[-1]
+            rr = int(d.get("resolution") or 0)
+            if fname not in best or rr > best[fname][0]:
+                best[fname] = (rr, u, int(d.get("size") or 0))
+    except Exception:
+        pass
+    try:
+        rp = requests.get(_H5_API + "/wefeed-h5api-bff/subject/play"
+                          "?subjectId=%s&detailPath=%s" % (sid, dp),
+                          headers=H, timeout=10)
+        pj = _unwrap(rp.json())
+        for s in (pj.get("streams") or []):
+            u = s.get("url") or ""
+            if not u or s.get("vipLocked"):
+                continue
+            fname = u.split("?")[0].rsplit("/", 1)[-1]
+            rr = int(s.get("resolutions") or s.get("resolution") or 0)
+            if fname not in best or rr > best[fname][0]:
+                best[fname] = (rr, u, int(s.get("size") or 0))
+    except Exception:
+        pass
+    cards = []
+    for fname, (rr, u, size) in sorted(best.items(),
+                                              key=lambda kv: -kv[1][0]):
+        res_str = _ql_label("%dp" % rr) if rr else "HLS"
+        cards.append({
+            "name": "♧ %s  ✹ %s" % (res_str, title),
+            "description": _fmt_card_desc("%dp" % rr if rr else "HLS", "",
+                                          _fmt_size(size), None,
+                                          ctype, se, ep, year, label, [],
+                                          via="File CDN"),
+            "url": u,
+            "behaviorHints": {"notWebReady": False, "isBingeable": True,
+                              "filename": "stream.mp4"},
+            "bingeGroup": "mbxr|%s:%s:%s|%s" % (
+                title, "", "", label),
+        })
+    _cache_put(_RES_CACHE, key, cards or None, 3600 if cards else 600)
+    return cards
 
 
 def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):

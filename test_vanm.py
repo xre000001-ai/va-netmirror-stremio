@@ -313,7 +313,7 @@ class ServerSmokeTests(unittest.TestCase):
             self.assertIn("NetMirror", m["description"])
             st, body = get("/health")
             self.assertEqual(json.loads(body)["ok"], True)
-            self.assertEqual(json.loads(body)["version"], "1.1.0")
+            self.assertEqual(json.loads(body)["version"], addon.VERSION)
             st, body = get("/nope")
             self.assertEqual(st, 404)
         finally:

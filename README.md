@@ -51,3 +51,6 @@ Config vars: `TMDB_KEY`, `MB_SECRET_KEY` (env/config only — no keys in the rep
 
 ### v1.0.1
 - Security: TMDB key read from `TMDB_KEY` env/config (public-repo key policy).
+
+### v1.1.2
+- mb_core refresh: MovieBox v1.9.14 — H5-gateway header-free file cards (signed MP4s) for movies; series stays on the cookie-scoped HLS ladder.
