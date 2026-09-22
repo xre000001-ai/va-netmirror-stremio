@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.27"
+VERSION   = "1.9.28"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2078,49 +2078,14 @@ def _web_lang_map(title, ctype):
     catalogs differ) -> {lang: [(sid, dp, site), ...]} for exact matches,
     netnaija entries first ('' = original). Cached; empty dict on miss."""
     key = (ctype, _web_norm_t(title))
-
-    def _one(site):
-        langs = {}
-        try:
-            jwt = _web_jwt(site)
-            if jwt:
-                r = requests.post(
-                    site + "/wefeed-h5api-bff/subject/search",
-                    json={"keyword": title, "page": 1, "perPage": 20,
-                          "subjectType": 1 if ctype == "movie" else 2,
-                          "tabId": "All"},
-                    headers={"Accept": "application/json",
-                             "Content-Type": "application/json",
-                             "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
-                             "X-Request-Lang": "en", "User-Agent": _WEB_UA,
-                             "Origin": site, "Referer": site + "/",
-                             "X-Source": "h5",
-                             "Authorization": "Bearer %s" % jwt},
-                    timeout=5)
-                items = (((r.json() or {}).get("data") or {}).get("items")) or []
-                for it in items:
-                    raw = (it.get("title") or "").strip()
-                    sid, dp = it.get("subjectId"), it.get("detailPath")
-                    if not sid or not dp:
-                        continue
-                    bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
-                    if _web_norm_t(_SEASON_TAIL.sub("", bare)) != \
-                            _web_norm_t(_SEASON_TAIL.sub("", title)):
-                        continue
-                    m = re.search(r"\[([^\]]+)\]", raw)
-                    lang = (m.group(1).strip() if m else "").lower()
-                    langs.setdefault(lang, []).append((str(sid), dp, site))
-        except Exception:
-            pass
-        return langs
-
     hit, val = _cache_get(_WEB_LANG_CACHE, key)
     if hit:
         return val or {}
     langs = {}
     try:
         with ThreadPoolExecutor(max_workers=2) as ex:
-            futs = [ex.submit(_one, s) for s in _WEB_SITES]
+            futs = [ex.submit(_web_rows_for, s, title, title, ctype)
+                    for s in _WEB_SITES]
             for f in futs:                 # netnaija future first -> priority
                 for lang, ents in (f.result() or {}).items():
                     langs.setdefault(lang, []).extend(ents)
@@ -2137,6 +2102,79 @@ def _web_lang_map(title, ctype):
     _cache_put(_WEB_LANG_CACHE, key, langs or None,
                _WEB_MP4_TTL if langs else _WEB_MP4_NEG)
     return langs
+
+
+def _web_rows_for(site, keyword, expect, ctype):
+    """One front's subject/search with `keyword` -> {lang: [(sid, dp, site)]}
+    for rows whose season-stripped, bracket-stripped title == expect
+    (v1.9.28: shared by the base map and the per-lang suffix lookup)."""
+    langs = {}
+    try:
+        jwt = _web_jwt(site)
+        if jwt:
+            r = requests.post(
+                site + "/wefeed-h5api-bff/subject/search",
+                json={"keyword": keyword, "page": 1, "perPage": 20,
+                      "subjectType": 1 if ctype == "movie" else 2,
+                      "tabId": "All"},
+                headers={"Accept": "application/json",
+                         "Content-Type": "application/json",
+                         "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                         "X-Request-Lang": "en", "User-Agent": _WEB_UA,
+                         "Origin": site, "Referer": site + "/",
+                         "X-Source": "h5",
+                         "Authorization": "Bearer %s" % jwt},
+                timeout=5)
+            items = (((r.json() or {}).get("data") or {}).get("items")) or []
+            for it in items:
+                raw = (it.get("title") or "").strip()
+                sid, dp = it.get("subjectId"), it.get("detailPath")
+                if not sid or not dp:
+                    continue
+                bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
+                if _web_norm_t(_SEASON_TAIL.sub("", bare)) != \
+                        _web_norm_t(_SEASON_TAIL.sub("", expect)):
+                    continue
+                m = re.search(r"\[([^\]]+)\]", raw)
+                lang = (m.group(1).strip() if m else "").lower()
+                langs.setdefault(lang, []).append((str(sid), dp, site))
+    except Exception:
+        pass
+    return langs
+
+
+def _web_lang_lookup(title, ctype, lang):
+    """v1.9.28 (user: 'Mousetrap web theke Hindi dub ase na — title e Hindi
+    lekha thake'): some dub rows only surface when the language word is IN
+    the keyword — 'Mousetrap' search returns [base, [English]] while
+    'Mousetrap Hindi' reveals 'Mousetrap [Hindi]' (both fronts, measured).
+    Lazy per-lang suffix search, cached with the same TTL machinery;
+    returns entries for exactly this lang (never the original row)."""
+    key = (ctype, _web_norm_t(title) + ":" + lang)
+    hit, val = _cache_get(_WEB_LANG_CACHE, key)
+    if hit:
+        return (val or {}).get(lang) or []
+    langs = {}
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_web_rows_for, s, "%s %s" % (title, lang),
+                              title, ctype) for s in _WEB_SITES]
+            for f in futs:
+                for l2, ents in (f.result() or {}).items():
+                    langs.setdefault(l2, []).extend(ents)
+    except Exception:
+        pass
+    for l2 in list(langs):
+        seen, out = set(), []
+        for e in langs[l2]:
+            if e[0] not in seen:
+                seen.add(e[0])
+                out.append(e)
+        langs[l2] = out
+    _cache_put(_WEB_LANG_CACHE, key, langs or None,
+               _WEB_MP4_TTL if langs else _WEB_MP4_NEG)
+    return langs.get(lang) or []
+
 
 def _web_mp4_streams(site, sid, dp, se, ep):
     """Signed per-resolution MP4s for one web (dub) subject.
@@ -2675,6 +2713,16 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
     lang = "" if (label or "").lower() in ("", "original", "default") \
         else (label or "").lower()
     ents = web_langs.get(lang) or []
+    if not ents and lang:
+        # v1.9.28: the base-keyword search hides some dub rows; ask the
+        # front for "title <lang>" before giving up (never falls back to
+        # the original-audio row — a Hindi card must be the Hindi subject)
+        ents = _web_lang_lookup(title, ctype, lang)
+        if ents:
+            try:
+                web_langs[lang] = ents     # share with sibling dubs/calls
+            except Exception:
+                pass
     if not ents:
         # never guess: a web card labeled (Hindi) must be the HINDI dub's
         # own web subject — mapping it to the original audio would mislabel
