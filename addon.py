@@ -52,7 +52,7 @@ def _mb_boot():
 _mb_boot()
 
 # ------------------------------------------------------------------ 1 config
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 BRAND = "VA × NetMirror"
 PORT = int(os.environ.get("PORT", "7000"))
 VN_PUBLIC_URL = os.environ.get("VN_PUBLIC_URL", "").rstrip("/")

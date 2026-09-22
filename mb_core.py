@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.23"
+VERSION   = "1.9.24"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1775,8 +1775,13 @@ def _cached_play(sid, se, ep):
 # --------------------------------------------------------------------------
 _WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-_WEB_JWT = None
-_WEB_JWT_TS = 0.0
+# v1.9.24 (user pointer "Movieboxonline.net"): the platform runs the SAME
+# wefeed white-label on TWO web fronts with DIFFERENT catalogs — netnaija.film
+# (web ids = mobile ids) and movieboxonline.net (own web ids; titles netnaija
+# lacks, e.g. The Matrix, measured live 360p-1080p MP4s). Both fronts are
+# whitelisted by the file-CDN referer gate. We now mine BOTH catalogs.
+_WEB_SITES = ("https://netnaija.film", "https://movieboxonline.net")
+_WEB_JWTS = {}                       # site -> (token, ts)
 _SUB_CACHE = {}   # (sid, stream_id) -> captions list (1h)
 _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
           "in_id": "ind", "id": "ind", "ms": "msa", "pt": "por", "ru": "rus",
@@ -1788,33 +1793,35 @@ _LANG3 = {"ar": "ara", "en": "eng", "es": "spa", "fil": "fil", "fr": "fra",
 _LANG1 = {v: k for k, v in _LANG3.items() if len(k) == 2}
 
 
-def _web_jwt():
+def _web_jwt(site=None):
     """Anonymous web JWT via the site's search-suggest (x-user response
-    header). Ungated — works from datacenter IPs, unlike subject/play."""
-    global _WEB_JWT, _WEB_JWT_TS
-    if _WEB_JWT and time.time() - _WEB_JWT_TS < 6 * 3600:
-        return _WEB_JWT
+    header). Ungated — works from datacenter IPs, unlike subject/play.
+    v1.9.24: per-site token cache (both fronts mint tokens)."""
+    site = site or _WEB_SITES[0]
+    hit = _WEB_JWTS.get(site)
+    if hit and time.time() - hit[1] < 6 * 3600:
+        return hit[0]
     try:
-        r = requests.post("https://netnaija.film/wefeed-h5api-bff/subject/search-suggest",
+        r = requests.post(site + "/wefeed-h5api-bff/subject/search-suggest",
                           json={"keyword": "a", "perPage": 1},
                           headers={"Accept": "application/json",
                                    "Content-Type": "application/json",
                                    "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
                                    "X-Request-Lang": "en", "User-Agent": _WEB_UA,
-                                   "Origin": "https://netnaija.film",
-                                   "Referer": "https://netnaija.film/"},
+                                   "Origin": site,
+                                   "Referer": site + "/"},
                           timeout=8)
         xu = r.headers.get("x-user") or ""
         if xu:
             try:
                 tok = json.loads(xu).get("token") or ""
                 if tok:
-                    _WEB_JWT, _WEB_JWT_TS = tok, time.time()
+                    _WEB_JWTS[site] = (tok, time.time())
             except Exception:
                 pass
     except Exception:
         pass
-    return _WEB_JWT
+    return (_WEB_JWTS.get(site) or (None, 0))[0]
 
 # v1.9.6 (user rule: "sub badh dile render bandwidth na kome tahole sub
 # back ano" — measured: the filter saved only ~111B per /stream resolve
@@ -1899,8 +1906,7 @@ def _web_captions(sid, stream_id):
         except requests.RequestException:
             return []
         if r.status_code in (401, 403):
-            global _WEB_JWT_TS
-            _WEB_JWT_TS = 0.0          # force a fresh token, retry once
+            _WEB_JWTS.pop(_WEB_SITES[0], None)   # force a fresh token, retry once
             continue
         try:
             return ((r.json().get("data") or {}).get("captions")) or []
@@ -2042,62 +2048,84 @@ _WEB_MP4_CACHE = {}                 # (sid, se, ep) -> (ts, streams|None)
 def _web_norm_t(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
-def _web_hdrs(referer=None):
+def _web_hdrs(site, referer=None):
     h = {"Accept": "application/json",
          "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
-         "User-Agent": _WEB_UA, "Origin": _WEB_SITE, "X-Source": ""}
+         "User-Agent": _WEB_UA, "Origin": site, "X-Source": ""}
     if referer:
         h["Referer"] = referer
     return h
 
 def _web_lang_map(title, ctype):
-    """One web search for the title -> {lang: (sid, detailPath)} for exact
-    matches ('' = original). Cached; empty dict on miss/absence."""
+    """One web search PER FRONT (v1.9.24: netnaija + movieboxonline, both
+    catalogs differ) -> {lang: [(sid, dp, site), ...]} for exact matches,
+    netnaija entries first ('' = original). Cached; empty dict on miss."""
     key = (ctype, _web_norm_t(title))
+
+    def _one(site):
+        langs = {}
+        try:
+            jwt = _web_jwt(site)
+            if jwt:
+                r = requests.post(
+                    site + "/wefeed-h5api-bff/subject/search",
+                    json={"keyword": title, "page": 1, "perPage": 20,
+                          "subjectType": 1 if ctype == "movie" else 2,
+                          "tabId": "All"},
+                    headers={"Accept": "application/json",
+                             "Content-Type": "application/json",
+                             "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
+                             "X-Request-Lang": "en", "User-Agent": _WEB_UA,
+                             "Origin": site, "Referer": site + "/",
+                             "X-Source": "h5",
+                             "Authorization": "Bearer %s" % jwt},
+                    timeout=5)
+                items = (((r.json() or {}).get("data") or {}).get("items")) or []
+                for it in items:
+                    raw = (it.get("title") or "").strip()
+                    sid, dp = it.get("subjectId"), it.get("detailPath")
+                    if not sid or not dp:
+                        continue
+                    bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
+                    if _web_norm_t(bare) != _web_norm_t(title):
+                        continue
+                    m = re.search(r"\[([^\]]+)\]", raw)
+                    lang = (m.group(1).strip() if m else "").lower()
+                    langs.setdefault(lang, []).append((str(sid), dp, site))
+        except Exception:
+            pass
+        return langs
+
     hit, val = _cache_get(_WEB_LANG_CACHE, key)
     if hit:
         return val or {}
     langs = {}
     try:
-        jwt = _web_jwt()
-        if jwt:
-            r = requests.post(
-                _WEB_SITE + "/wefeed-h5api-bff/subject/search",
-                json={"keyword": title, "page": 1, "perPage": 20,
-                      "subjectType": 1 if ctype == "movie" else 2,
-                      "tabId": "All"},
-                headers={"Accept": "application/json",
-                         "Content-Type": "application/json",
-                         "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
-                         "X-Request-Lang": "en", "User-Agent": _WEB_UA,
-                         "Origin": _WEB_SITE, "Referer": _WEB_SITE + "/",
-                         "X-Source": "h5",
-                         "Authorization": "Bearer %s" % jwt},
-                timeout=5)
-            items = (((r.json() or {}).get("data") or {}).get("items")) or []
-            for it in items:
-                raw = (it.get("title") or "").strip()
-                sid, dp = it.get("subjectId"), it.get("detailPath")
-                if not sid or not dp:
-                    continue
-                bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
-                if _web_norm_t(bare) != _web_norm_t(title):
-                    continue
-                m = re.search(r"\[([^\]]+)\]", raw)
-                lang = (m.group(1).strip() if m else "").lower()
-                langs.setdefault(lang, (str(sid), dp))
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_one, s) for s in _WEB_SITES]
+            for f in futs:                 # netnaija future first -> priority
+                for lang, ents in (f.result() or {}).items():
+                    langs.setdefault(lang, []).extend(ents)
     except Exception:
         pass
+    # dedupe identical subjects (catalog overlaps)
+    for lang in list(langs):
+        seen, out = set(), []
+        for e in langs[lang]:
+            if e[0] not in seen:
+                seen.add(e[0])
+                out.append(e)
+        langs[lang] = out
     _cache_put(_WEB_LANG_CACHE, key, langs or None,
                _WEB_MP4_TTL if langs else _WEB_MP4_NEG)
     return langs
 
-def _web_mp4_streams(sid, dp, se, ep):
+def _web_mp4_streams(site, sid, dp, se, ep):
     """Signed per-resolution MP4s for one web (dub) subject.
     Returns [(res_int, url, size_bytes, codec, duration)] desc, or []."""
     if not WEB_MP4_ON:
         return []
-    key = (sid, se, ep)
+    key = (site, sid, se, ep)
     hit, val = _cache_get(_WEB_MP4_CACHE, key)
     if hit:
         return val or []
@@ -2106,12 +2134,12 @@ def _web_mp4_streams(sid, dp, se, ep):
         if _ddl_left() is not None and _ddl_left() < 2.5:
             return []                      # too late in the budget — skip
         s = requests.Session()
-        s.get(_WEB_SITE + "/videoPlayPage/" + dp,
+        s.get(site + "/videoPlayPage/" + dp,
               headers={"User-Agent": _WEB_UA, "Accept": "text/html"},
               timeout=4)
-        r = s.get(_WEB_SITE + "/wefeed-h5api-bff/subject/play"
+        r = s.get(site + "/wefeed-h5api-bff/subject/play"
                   "?subjectId=%s&se=%s&ep=%s&detailPath=%s" % (sid, se, ep, dp),
-                  headers=_web_hdrs(_WEB_SITE + "/videoPlayPage/" + dp),
+                  headers=_web_hdrs(site, site + "/videoPlayPage/" + dp),
                   timeout=5)
         d = (r.json() or {}).get("data") or {}
         if d.get("hasResource") or d.get("streams"):
@@ -2610,16 +2638,23 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
         return []
     lang = "" if (label or "").lower() in ("", "original", "default") \
         else (label or "").lower()
-    ent = web_langs.get(lang)
-    if not ent:
+    ents = web_langs.get(lang) or []
+    if not ents:
         # never guess: a web card labeled (Hindi) must be the HINDI dub's
         # own web subject — mapping it to the original audio would mislabel
         return []
-    wsid, wdp = ent
     use_se, use_ep = (se, ep) if ctype == "series" else (0, 0)
-    st = _web_mp4_streams(wsid, wdp, use_se, use_ep)
+    # v1.9.24: entries are ordered (netnaija first, then movieboxonline) —
+    # the first front that actually HAS signed streams wins the label
+    st, wsite = [], None
+    for wsid, wdp, wsite in ents:
+        st = _web_mp4_streams(wsite, wsid, wdp, use_se, use_ep)
+        if st:
+            break
     if not st:
         return []
+    via = "Netnaija WEB" if wsite == _WEB_SITES[0] else "MovieBox WEB"
+    ref = {"Referer": wsite, "Origin": wsite, "User-Agent": UA_APP}
     cards = []
     for res_i, url, size, codec, dur in st:
         cl = _CODEC_LABEL.get((codec or "").lower())
@@ -2628,14 +2663,13 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
             "name": "♧ %dp  ✹ %s" % (res_i, title),   # v1.9.9: no dub bracket
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
-                ctype, se, ep, year, label, [], via="Netnaija WEB"),
+                ctype, se, ep, year, label, [], via=via),
             # signed DIRECT URL — zero media bytes; carries ITS source
-            # site's referer (netnaija.film) for header-capable players
+            # site's referer (both fronts pass the file-CDN gate)
             "url": url,
             "_api": "webmp4",
             "behaviorHints": {"notWebReady": False, "isBingeable": True,
-                              "proxyHeaders": {"request":
-                                               _stream_headers("web")}},
+                              "proxyHeaders": {"request": ref}},
             "bingeGroup": "mbxw|%s:%s:%s|%s|%dp" % (
                 title, se if ctype == "series" else "",
                 ep if ctype == "series" else "", label, res_i),
