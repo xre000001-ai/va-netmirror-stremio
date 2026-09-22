@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.20"
+VERSION   = "1.9.21"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2387,12 +2387,15 @@ _H5_WEB = "https://h5.aoneroom.com"
 _H5_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 _H5_SPOOF = "103.241.224.%d" % random.randint(1, 254)
-# v1.9.19: the file-CDN referer gate WHITELISTS the platform's own web
+# v1.9.21: the file-CDN referer gate WHITELISTS the platform's own web
 # sites — measured live: Referer movieboxonline.net / netnaija.film =>
 # 426 (referer PASS, datacenter-IP block), any other referer / none =>
-# 429 (referer-blocked).  sportslive.wine (MovieBox-Tui's) fails the
-# gate from datacenter IPs too.
-STREAM_REFERER = "https://movieboxonline.net"
+# 429 (referer-blocked).  Each card family now carries ITS OWN source
+# site's referer (one tidy builder instead of scattered dicts):
+def _stream_headers(source):
+    ref = ("https://netnaija.film" if source == "web"
+           else "https://movieboxonline.net")
+    return {"Referer": ref, "Origin": ref, "User-Agent": UA_APP}
 _H5_DP_CACHE = {}
 
 
@@ -2527,9 +2530,7 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     # candidate concurrently; definitive-dead (403/404/410) dropped, the
     # rest ordered FASTEST-CDN-FIRST.  Unprovable URLs (throttled probe
     # IPs) stay, ranked last — they often still play from residential.
-    fh = {"Referer": STREAM_REFERER,
-          "Origin": STREAM_REFERER,
-          "User-Agent": UA_APP}
+    fh = _stream_headers("app")
     cands = sorted(best.items(), key=lambda kv: -kv[1][0])
 
     def _probe(item):
@@ -2607,15 +2608,13 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
             "description": _fmt_card_desc(
                 "%dp" % res_i, cl, _fmt_size(size), _fmt_dur(dur),
                 ctype, se, ep, year, label, [], via="Netnaija WEB"),
-            # signed DIRECT URL — zero media bytes; carries the file-CDN
-            # referer whitelist header (v1.9.19) for header-capable players
+            # signed DIRECT URL — zero media bytes; carries ITS source
+            # site's referer (netnaija.film) for header-capable players
             "url": url,
             "_api": "webmp4",
             "behaviorHints": {"notWebReady": False, "isBingeable": True,
-                              "proxyHeaders": {"request": {
-                                  "Referer": STREAM_REFERER,
-                                  "Origin": STREAM_REFERER,
-                                  "User-Agent": UA_APP}}},
+                              "proxyHeaders": {"request":
+                                               _stream_headers("web")}},
             "bingeGroup": "mbxw|%s:%s:%s|%s|%dp" % (
                 title, se if ctype == "series" else "",
                 ep if ctype == "series" else "", label, res_i),
