@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.24"
+VERSION   = "1.9.25"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2555,23 +2555,25 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     _g1, _g2 = _exg.submit(_fire_dl), _exg.submit(_fire_pl)
     wait([_g1, _g2], timeout=9)
     _exg.shutdown(wait=False)
-    best = {}                       # fname -> (res, url, size)
+    best = {}                       # fname -> (res, url, size, codec)
     for d in (_unwrap(_dj.get("j") or {}).get("downloads") or []):
         u = d.get("url") or ""
         if not u or d.get("vipLocked"):
             continue
         fname = u.split("?")[0].rsplit("/", 1)[-1]
         rr = int(d.get("resolution") or 0)
+        cc = str(d.get("codecName") or d.get("codec") or "")
         if fname not in best or rr > best[fname][0]:
-            best[fname] = (rr, u, int(d.get("size") or 0))
+            best[fname] = (rr, u, int(d.get("size") or 0), cc)
     for s in (_unwrap(_pj.get("j") or {}).get("streams") or []):
         u = s.get("url") or ""
         if not u or s.get("vipLocked"):
             continue
         fname = u.split("?")[0].rsplit("/", 1)[-1]
         rr = int(s.get("resolutions") or s.get("resolution") or 0)
+        cc = str(s.get("codecName") or s.get("codec") or "")
         if fname not in best or rr > best[fname][0]:
-            best[fname] = (rr, u, int(s.get("size") or 0))
+            best[fname] = (rr, u, int(s.get("size") or 0), cc)
     # v1.9.15 CloudStream-style test-then-show: 2-byte probe of every
     # candidate concurrently; definitive-dead (403/404/410) dropped, the
     # rest ordered FASTEST-CDN-FIRST.  Unprovable URLs (throttled probe
@@ -2583,33 +2585,41 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     cands = sorted(best.items(), key=lambda kv: -kv[1][0])
 
     def _probe(item):
-        fname, (rr, u, size) = item
+        fname, (rr, u, size, cc) = item
         t0 = time.time()
         try:
             r = requests.get(u, headers=dict(fh, Range="bytes=0-1"),
                              timeout=1.8, stream=True)
             r.close()
-            return (rr, u, size, r.status_code,
+            return (rr, u, size, cc, r.status_code,
                     (time.time() - t0) * 1000.0)
         except Exception:
-            return (rr, u, size, 0, 9999.0)
+            return (rr, u, size, cc, 0, 9999.0)
 
     probed = []
     with ThreadPoolExecutor(max_workers=6) as exp:
         probed = list(exp.map(_probe, cands))
-    live = [(rr, u, size, ms) for (rr, u, size, st, ms) in probed
+    live = [(rr, u, size, cc, ms) for (rr, u, size, cc, st, ms) in probed
             if st in (200, 206)]
-    soft = [(rr, u, size, 8000.0 + i) for i, (rr, u, size, st, ms)
+    soft = [(rr, u, size, cc, 8000.0 + i) for i, (rr, u, size, cc, st, ms)
             in enumerate(probed) if st not in (200, 206, 403, 404, 410)]
-    ranked = sorted(live + soft, key=lambda t: t[3])
+
+    def _h264_first(t):
+        # v1.9.25 (user: HEVC files = 0.17 Mbps for them): inside the
+        # file family, known-H264 before HEVC/unknown, probe rank next
+        cl = (t[3] or "").lower()
+        return (0 if ("264" in cl or cl == "avc") else 1, t[4])
+
+    ranked = sorted(live + soft, key=_h264_first)
 
     cards = []
-    for rr, u, size, _ms in ranked:
+    for rr, u, size, cc, _ms in ranked:
         res_str = _ql_label("%dp" % rr) if rr else "HLS"
         cards.append({
             "_api": "h5-dl",
             "name": "♧ %s  ✹ %s" % (res_str, title),
-            "description": _fmt_card_desc("%dp" % rr if rr else "HLS", "",
+            "description": _fmt_card_desc("%dp" % rr if rr else "HLS",
+                                          _CODEC_LABEL.get((cc or "").lower(), ""),
                                           _fmt_size(size), None,
                                           ctype, se, ep, year, label, [],
                                           via="File CDN"),
@@ -3002,9 +3012,12 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 s["description"] = (head + "\n" + base + "  ⟡ " +
                                     _sub_line(shared)[2:]).rstrip()
     if streams:
-        # v1.9.19: tidy ordering (user: "etoh ogochano") — fast file cards
-        # first (probe-ranked), then web MP4s, the cookie-HLS ladder last
-        _fam = {"h5-dl": 0, "h5-play": 0, "webmp4": 1, "mobile-hls": 2}
+        # v1.9.25 (user: "hevc file gulo te problem only 0.17 Mbps"): the
+        # file-CDN download files are the HEVC-heavy family and the user
+        # measures them at 0.17 Mbps while web H264 MP4s play fast — so
+        # the H264 web cards go FIRST now, then the H5 web-player stream,
+        # then the download files, ladder last.
+        _fam = {"webmp4": 0, "h5-play": 1, "h5-dl": 2, "mobile-hls": 3}
 
         def _ord(c):
             fam = _fam.get(c.get("_api"))
