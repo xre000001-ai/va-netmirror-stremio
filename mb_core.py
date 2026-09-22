@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.29"
+VERSION   = "1.9.30"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2062,6 +2062,11 @@ _WEB_MP4_CACHE = {}                 # (sid, se, ep) -> (ts, streams|None)
 def _web_norm_t(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
+# v1.9.30: mobile dub labels vs web bracket labels disagree sometimes
+_LANG_SYN = {"bangla": "bengali", "bengali": "bangla",
+             "mandarin": "chinese", "chinese": "mandarin",
+             "espanol": "spanish", "spanish": "espanol"}
+
 # v1.9.26: web series rows are SEASON-formatted ("Game of Thrones S8",
 # "Money Heist S1-S5") while the SAME subjectId serves every season via
 # se/ep — match on the season-stripped base
@@ -2189,8 +2194,12 @@ def _web_mp4_streams(site, sid, dp, se, ep):
         return val or []
     out = []
     try:
-        if _ddl_left() is not None and _ddl_left() < 2.5:
-            return []                      # too late in the budget — skip
+        if _ddl_left() is not None and _ddl_left() < 1.0:
+            return []                      # only skip when truly out of time
+        # v1.9.30: was <2.5 — on churn-slow builds the web mint got skipped
+        # at the tail of the budget ("web e thaka sotteo web pare na").
+        # Web play-mint is 2 quick calls (~0.5-1s); keep it possible till
+        # the last second of the wall.
         s = requests.Session()
         s.get(site + "/videoPlayPage/" + dp,
               headers={"User-Agent": _WEB_UA, "Accept": "text/html"},
@@ -2715,11 +2724,14 @@ def _web_cards_for(title, label, ctype, se, ep, mob_sid, web_langs, year=""):
     lang = "" if (label or "").lower() in ("", "original", "default") \
         else (label or "").lower()
     ents = web_langs.get(lang) or []
+    if not ents and lang and _LANG_SYN.get(lang):
+        # v1.9.30: Bangla vs Bengali, Mandarin vs Chinese, ...
+        ents = web_langs.get(_LANG_SYN[lang]) or []
     if not ents and lang:
         # v1.9.28: the base-keyword search hides some dub rows; ask the
         # front for "title <lang>" before giving up (never falls back to
         # the original-audio row — a Hindi card must be the Hindi subject)
-        ents = _web_lang_lookup(title, ctype, lang)
+        ents = _web_lang_lookup(title, ctype, _LANG_SYN.get(lang) or lang)
         if ents:
             try:
                 web_langs[lang] = ents     # share with sibling dubs/calls
@@ -2968,6 +2980,23 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
         web_langs = web_f.result(timeout=8) if web_f else None
     except Exception:
         web_langs = None
+    if WEB_MP4_ON and not web_langs and alt_fut is not None:
+        # v1.9.30 (user: "web e thaka sotteo web pare na"): the WEB
+        # catalog often lists the show under an alternative name; the
+        # mobile side has had this rescue since v1.7.2, the web map
+        # never did. Try the alt titles until one matches.
+        try:
+            alts0 = (alt_fut.result(timeout=4) if alt_fut
+                     else _alt_titles(ctype, meta.get("tmdb"))) or []
+        except Exception:
+            alts0 = []
+        for alt in alts0[:3]:
+            if clean_title(alt).lower() == clean_title(title).lower():
+                continue
+            m2 = _web_lang_map(alt, ctype)
+            if m2:
+                web_langs = m2
+                break
     _t = time.time()
     matched = match_subjects(subs, title, year, stype, season=se) if subs else []
     _ph("match", _t)
@@ -3099,16 +3128,18 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 s["description"] = (head + "\n" + base + "  ⟡ " +
                                     _sub_line(shared)[2:]).rstrip()
     if streams:
-        # v1.9.29 (user: "hevc sob dei" — the HEVC DASH ladder is the
-        # catch-all that always plays from their device; web cards often
-        # don't come): LADDER FIRST again, then web H264, the H5
-        # web-player stream, and the slow HEVC-heavy download files last.
-        _fam = {"mobile-hls": 0, "webmp4": 1, "h5-play": 2, "h5-dl": 3}
+        # v1.9.30 (user: "hevc guloi toh problem ... web e thaka sotteo
+        # web pare na"): HEVC IS the pain (0.17 Mbps files, slow ladder
+        # muxes) — the FAST web H264 cards go first again; the ladder
+        # still follows as the catch-all, files last. The real fix this
+        # round is making web cards RELIABLE (see _web_mp4_streams
+        # budget floor + alt-name rescue + lang synonyms).
+        _fam = {"webmp4": 0, "h5-play": 1, "mobile-hls": 2, "h5-dl": 3}
 
         def _ord(c):
             fam = _fam.get(c.get("_api"))
             if fam is None:
-                fam = 0 if "/hls/" in (c.get("url") or "") else 1
+                fam = 3 if "/hls/" in (c.get("url") or "") else 1
             m = re.search(r"(\d{3,4})p", c.get("name") or "")
             return (fam, -int(m.group(1)) if m else 0)
 
