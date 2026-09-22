@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.21"
+VERSION   = "1.9.22"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2496,40 +2496,56 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     # (generic site referer -> code 0 with empty downloads)
     H["Referer"] = ("https://fmoviesunblocked.net/spa/videoPlayPage/movies/"
                     "%s?id=%s&type=/movie/detail" % (dp, sid))
-    best = {}                       # base_url -> (res, url, size)
-    try:
-        rd = requests.get(_H5_API + "/wefeed-h5api-bff/subject/download"
-                          "?subjectId=%s&detailPath=%s" % (sid, dp),
-                          headers=H, timeout=10)
-        for d in (_unwrap(rd.json()).get("downloads") or []):
-            u = d.get("url") or ""
-            if not u or d.get("vipLocked"):
-                continue
-            fname = u.split("?")[0].rsplit("/", 1)[-1]
-            rr = int(d.get("resolution") or 0)
-            if fname not in best or rr > best[fname][0]:
-                best[fname] = (rr, u, int(d.get("size") or 0))
-    except Exception:
-        pass
-    try:
-        rp = requests.get(_H5_API + "/wefeed-h5api-bff/subject/play"
-                          "?subjectId=%s&detailPath=%s" % (sid, dp),
-                          headers=H, timeout=10)
-        pj = _unwrap(rp.json())
-        for s in (pj.get("streams") or []):
-            u = s.get("url") or ""
-            if not u or s.get("vipLocked"):
-                continue
-            fname = u.split("?")[0].rsplit("/", 1)[-1]
-            rr = int(s.get("resolutions") or s.get("resolution") or 0)
-            if fname not in best or rr > best[fname][0]:
-                best[fname] = (rr, u, int(s.get("size") or 0))
-    except Exception:
-        pass
+    # v1.9.22: fire BOTH gateway calls concurrently (was sequential —
+    # 2 x up-to-10s compounded into every cold /stream)
+    _dj, _pj = {}, {}
+
+    def _fire_dl():
+        try:
+            _dj["j"] = requests.get(
+                _H5_API + "/wefeed-h5api-bff/subject/download"
+                "?subjectId=%s&detailPath=%s" % (sid, dp),
+                headers=H, timeout=8).json()
+        except Exception:
+            pass
+
+    def _fire_pl():
+        try:
+            _pj["j"] = requests.get(
+                _H5_API + "/wefeed-h5api-bff/subject/play"
+                "?subjectId=%s&detailPath=%s" % (sid, dp),
+                headers=H, timeout=8).json()
+        except Exception:
+            pass
+
+    _exg = ThreadPoolExecutor(max_workers=2)
+    _g1, _g2 = _exg.submit(_fire_dl), _exg.submit(_fire_pl)
+    wait([_g1, _g2], timeout=9)
+    _exg.shutdown(wait=False)
+    best = {}                       # fname -> (res, url, size)
+    for d in (_unwrap(_dj.get("j") or {}).get("downloads") or []):
+        u = d.get("url") or ""
+        if not u or d.get("vipLocked"):
+            continue
+        fname = u.split("?")[0].rsplit("/", 1)[-1]
+        rr = int(d.get("resolution") or 0)
+        if fname not in best or rr > best[fname][0]:
+            best[fname] = (rr, u, int(d.get("size") or 0))
+    for s in (_unwrap(_pj.get("j") or {}).get("streams") or []):
+        u = s.get("url") or ""
+        if not u or s.get("vipLocked"):
+            continue
+        fname = u.split("?")[0].rsplit("/", 1)[-1]
+        rr = int(s.get("resolutions") or s.get("resolution") or 0)
+        if fname not in best or rr > best[fname][0]:
+            best[fname] = (rr, u, int(s.get("size") or 0))
     # v1.9.15 CloudStream-style test-then-show: 2-byte probe of every
     # candidate concurrently; definitive-dead (403/404/410) dropped, the
     # rest ordered FASTEST-CDN-FIRST.  Unprovable URLs (throttled probe
     # IPs) stay, ranked last — they often still play from residential.
+    # v1.9.22: the probes are the /hls latency killer — each 429 round
+    # trip burns 3-9s of the stream request (10 files = a stall).  Cap
+    # at 1.8s so dead gates answer in one beat instead of a chorus.
     fh = _stream_headers("app")
     cands = sorted(best.items(), key=lambda kv: -kv[1][0])
 
@@ -2538,7 +2554,7 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
         t0 = time.time()
         try:
             r = requests.get(u, headers=dict(fh, Range="bytes=0-1"),
-                             timeout=5, stream=True)
+                             timeout=1.8, stream=True)
             r.close()
             return (rr, u, size, r.status_code,
                     (time.time() - t0) * 1000.0)
