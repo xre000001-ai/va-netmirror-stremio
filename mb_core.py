@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.25"
+VERSION   = "1.9.26"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2048,6 +2048,11 @@ _WEB_MP4_CACHE = {}                 # (sid, se, ep) -> (ts, streams|None)
 def _web_norm_t(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
+# v1.9.26: web series rows are SEASON-formatted ("Game of Thrones S8",
+# "Money Heist S1-S5") while the SAME subjectId serves every season via
+# se/ep — match on the season-stripped base
+_SEASON_TAIL = re.compile(r"\s*s\d{1,2}(?:\s*-\s*s?\d{1,3})?\s*$", re.I)
+
 def _web_hdrs(site, referer=None):
     h = {"Accept": "application/json",
          "X-Client-Info": json.dumps({"timezone": "Asia/Dhaka"}),
@@ -2087,7 +2092,8 @@ def _web_lang_map(title, ctype):
                     if not sid or not dp:
                         continue
                     bare = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
-                    if _web_norm_t(bare) != _web_norm_t(title):
+                    if _web_norm_t(_SEASON_TAIL.sub("", bare)) != \
+                            _web_norm_t(_SEASON_TAIL.sub("", title)):
                         continue
                     m = re.search(r"\[([^\]]+)\]", raw)
                     lang = (m.group(1).strip() if m else "").lower()
@@ -2327,7 +2333,7 @@ def _resolve_entry(pair, se, ep, ctype, title, year, caps=None, web_langs=None):
                                 year=year) if _RESOURCE_ON else []
     res_bases = {c["url"].split("?")[0] for c in res_cards}
     pi = _cached_play(sid, se if ctype == "series" else None,
-                      ep if ctype == "series" else None)
+                      ep if ctype == "series" else None) if sid else None
     if not pi:
         # web MP4s can still exist even when the mobile play-info is
         # transiently sick — try them before giving up on this dub
@@ -2506,7 +2512,7 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     the H5 gateway exposes no episode files (verified GoT S1E1 = 0) so
     this returns [] and the cookie-scoped HLS ladder stays the series
     path."""
-    if ctype != "movie":
+    if ctype != "movie" or not str(sid or "").strip():
         return []
     key = ("h5", str(sid))
     hit, val = _cache_get(_RES_CACHE, key)
@@ -2879,12 +2885,19 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     # localized-name titles before any card appeared.
     alt_fut = (_META_EX.submit(_alt_titles, ctype, meta.get("tmdb"))
                if meta.get("tmdb") else None)
+    web_f = (_META_EX.submit(_web_lang_map, title, ctype)
+             if WEB_MP4_ON else None)
     _t = time.time()
     subs = _cached_search(title, stype)
     _ph("search", _t)
     if subs is None:
         # transient egress failure — NOT cached; the player may retry at once
         return {"streams": [], "message": "platform busy — try again"}
+    web_langs = None
+    try:
+        web_langs = web_f.result(timeout=8) if web_f else None
+    except Exception:
+        web_langs = None
     _t = time.time()
     matched = match_subjects(subs, title, year, stype, season=se) if subs else []
     _ph("match", _t)
@@ -2917,10 +2930,10 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                     if matched:
                         break
     _ph("rescue", _rt)
-    if not subs and not matched:
+    if not subs and not matched and not web_langs:
         _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "not in platform catalog"}
-    if not matched:
+    if not matched and not web_langs:
         _cache_put(_STREAM_CACHE, key, [], _neg_ttl())
         return {"streams": [], "message": "no matching subject"}
     # v1.7.6: dub lists AND play-info for the top matches run in the SAME
@@ -2960,6 +2973,11 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 seen_labels.add(nm)
                 entries.append((dsid, nm))
     entries = entries[:8]
+    if not entries and web_langs:
+        # v1.9.26: WEB-ONLY rescue — the mobile API churns (search returns
+        # valid-empty in waves); the web fronts are independent catalogs,
+        # so mint the original-language web cards with no mobile subject
+        entries = [("", "")]
 
     def _title_caps():
         """ONE caption fetch for the whole title (dubs share the same set;
@@ -2987,7 +3005,6 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
     # v1.9.1: ONE web search for the title maps dubs to the site's web
     # subjects, so each dub can mint its per-resolution direct MP4s.
     _t = time.time()
-    web_langs = _web_lang_map(title, ctype) if WEB_MP4_ON else None
     with ThreadPoolExecutor(max_workers=8) as ex:
         cap_fut = ex.submit(_ddl_inherit(_title_caps))
         results = list(ex.map(_ddl_inherit(
