@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.22"
+VERSION   = "1.9.23"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2030,6 +2030,11 @@ def _pretty_label(nm):
 WEB_MP4_ON = os.environ.get("MOVIEBOX_WEB_MP4", "0").strip().lower() \
     in ("1", "true", "on")
 _WEB_SITE = "https://netnaija.film"
+# v1.9.23 (user directive): when the netnaija web catalog has FAST MP4s
+# for a title, the slow cookie-HLS ladder ("forced HLS") must NOT show —
+# it only muddies the list.  Titles without web files keep the ladder
+# (series have nothing else).  Env NETNAIJA_HLS_SUPPRESS=0 re-enables.
+_WEB_HLS_SUPPRESS = os.environ.get("NETNAIJA_HLS_SUPPRESS", "1") != "0"
 _WEB_MP4_TTL = 40 * 60              # signed URLs live ~17h; 40min freshness
 _WEB_MP4_NEG = 10 * 60
 _WEB_LANG_CACHE = {}                # (ctype, norm_title) -> (ts, {lang:(sid,dp)})
@@ -2975,6 +2980,10 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
             return (fam, -int(m.group(1)) if m else 0)
 
         streams.sort(key=_ord)
+        if (_WEB_HLS_SUPPRESS and ctype == "movie"
+                and any(c.get("_api") == "webmp4" for c in streams)):
+            streams = [c for c in streams
+                       if c.get("_api") != "mobile-hls"]
         _cache_put(_STREAM_CACHE, key, streams, _STREAM_CACHE_TTL)
         _stale_put(key, streams)   # v1.9.3: sweeps expired entries on write
         if _prewarm_next and ctype == "series":
