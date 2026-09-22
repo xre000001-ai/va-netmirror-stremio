@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.28"
+VERSION   = "1.9.29"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -2048,11 +2048,13 @@ def _pretty_label(nm):
 WEB_MP4_ON = os.environ.get("MOVIEBOX_WEB_MP4", "0").strip().lower() \
     in ("1", "true", "on")
 _WEB_SITE = "https://netnaija.film"
-# v1.9.23 (user directive): when the netnaija web catalog has FAST MP4s
-# for a title, the slow cookie-HLS ladder ("forced HLS") must NOT show —
-# it only muddies the list.  Titles without web files keep the ladder
-# (series have nothing else).  Env NETNAIJA_HLS_SUPPRESS=0 re-enables.
-_WEB_HLS_SUPPRESS = os.environ.get("NETNAIJA_HLS_SUPPRESS", "1") != "0"
+# v1.9.29 (user reversal of the v1.9.23 rule: "web er card ase na, kintu
+# hevc sob dei"): the WEB cards often don't exist/come for the titles the
+# user watches, while the HEVC DASH ladder covers EVERYTHING and plays
+# fine from their device (sbcdn3 throttles datacenter IPs, not theirs).
+# The ladder is therefore NEVER auto-dropped now; env
+# NETNAIJA_HLS_SUPPRESS=1 restores the old suppression.
+_WEB_HLS_SUPPRESS = os.environ.get("NETNAIJA_HLS_SUPPRESS", "0") == "1"
 _WEB_MP4_TTL = 40 * 60              # signed URLs live ~17h; 40min freshness
 _WEB_MP4_NEG = 10 * 60
 _WEB_LANG_CACHE = {}                # (ctype, norm_title) -> (ts, {lang:(sid,dp)})
@@ -3097,17 +3099,16 @@ def _build_streams_inner(ctype, imdb, se, ep, key, _prewarm_next):
                 s["description"] = (head + "\n" + base + "  ⟡ " +
                                     _sub_line(shared)[2:]).rstrip()
     if streams:
-        # v1.9.25 (user: "hevc file gulo te problem only 0.17 Mbps"): the
-        # file-CDN download files are the HEVC-heavy family and the user
-        # measures them at 0.17 Mbps while web H264 MP4s play fast — so
-        # the H264 web cards go FIRST now, then the H5 web-player stream,
-        # then the download files, ladder last.
-        _fam = {"webmp4": 0, "h5-play": 1, "h5-dl": 2, "mobile-hls": 3}
+        # v1.9.29 (user: "hevc sob dei" — the HEVC DASH ladder is the
+        # catch-all that always plays from their device; web cards often
+        # don't come): LADDER FIRST again, then web H264, the H5
+        # web-player stream, and the slow HEVC-heavy download files last.
+        _fam = {"mobile-hls": 0, "webmp4": 1, "h5-play": 2, "h5-dl": 3}
 
         def _ord(c):
             fam = _fam.get(c.get("_api"))
             if fam is None:
-                fam = 2 if "/hls/" in (c.get("url") or "") else 1
+                fam = 0 if "/hls/" in (c.get("url") or "") else 1
             m = re.search(r"(\d{3,4})p", c.get("name") or "")
             return (fam, -int(m.group(1)) if m else 0)
 
