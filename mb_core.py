@@ -50,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config — branding, hosts, tuning
 # --------------------------------------------------------------------------
-VERSION   = "1.9.26"
+VERSION   = "1.9.27"
 BRAND = "MovieBox"
 PORT = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("MB_PUBLIC_URL", "").rstrip("/")
@@ -1711,7 +1711,8 @@ _STREAM_REFRESHING = set()
 _REFRESH_LOCK = threading.Lock()
 _PLAY_CACHE = {}         # (sid, se, ep) -> play-info payload (10 min)
 _DUB_CACHE = {}          # sid -> dub list (30 min)
-_SEARCH_CACHE = {}       # (kw, subject_type) -> subjects (10 min)
+_SEARCH_CACHE = {}
+_RESEARCH_TS = [0.0]             # v1.9.27 token re-mint throttle       # (kw, subject_type) -> subjects (10 min)
 
 def _cached_search(kw, subject_type):
     key = (kw, subject_type)
@@ -1719,6 +1720,17 @@ def _cached_search(kw, subject_type):
     if hit:
         return val
     val = search_subjects(kw, subject_type)
+    # v1.9.27 (token-vintage churn): the platform's churn waves answer
+    # FRESH tokens with a valid EMPTY list while older tokens keep
+    # working — never accept an empty as definitive on the first answer;
+    # re-mint the bootstrap token once and retry before caching [].
+    if val is not None and not val and time.time() - _RESEARCH_TS[0] > 300:
+        _RESEARCH_TS[0] = time.time()
+        try:
+            _bootstrap_token()
+            val = search_subjects(kw, subject_type)
+        except Exception:
+            pass
     # v1.7.0: None = transient transport failure — NEVER cached (the next
     # request retries). [] = the platform definitively answered "not in
     # catalog" — safe to cache for the full TTL.
@@ -2639,6 +2651,14 @@ def _resource_cards(sid, title, ctype, se, ep, label="", year=""):
     for c in cards:
         if "tran-audio" in (c.get("url") or ""):
             c["_api"] = "h5-play"
+    # v1.9.27 anti-shrink: a churn wave answers with a SHRUNKEN download
+    # list (withheld 1080p links, empty urls) — never let it overwrite a
+    # richer set for the full 6h; serve stale and re-probe in 10 min.
+    st_prev = _RES_STALE.get(key)
+    if cards and st_prev and len(cards) < len(st_prev[1]):
+        cards = st_prev[1]
+        _cache_put(_RES_CACHE, key, cards, 600)
+        return cards
     _cache_put(_RES_CACHE, key, cards or None, 21600 if cards else 600)
     if cards:
         _RES_STALE[key] = (time.time(), cards)
